@@ -343,7 +343,7 @@ def discover_market(asset: str, on_log: Callable) -> Optional[dict]:
     try:
         data = kalshi_get_public("/markets", params={
             "series_ticker": series,
-            "limit":         10,
+            "limit":         200,
         })
         mkts = data.get("markets", [])
 
@@ -356,7 +356,7 @@ def discover_market(asset: str, on_log: Callable) -> Optional[dict]:
             return None
 
         now = datetime.now(timezone.utc)
-        open_mkts = [m for m in mkts if m.get("status") == "open"]
+        open_mkts = [m for m in mkts if m.get("status") == "active"]
         init_mkts = [m for m in mkts if m.get("status") == "initialized"]
 
         if not open_mkts:
