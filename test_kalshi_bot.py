@@ -1,0 +1,1022 @@
+"""
+test_kalshi_bot.py - Test suite for engine.py + trader.py
+
+Run:  python -m pytest test_kalshi_bot.py -v
+  or: python -m unittest test_kalshi_bot -v
+
+Tests cover:
+  1. Fee formula correctness
+  2. Orderbook mechanics (snapshot, delta apply, implied ask derivation)
+  3. Market snapshot + arb detection
+  4. Auth header generation (structure only)
+  5. Price parsing helpers
+  6. QuoteManager logic
+  7. PositionBook tracking
+  8. DRY_RUN order execution path
+  9. BotEngine callbacks (no real WS)
+"""
+
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from decimal import Decimal
+from pathlib import Path
+from unittest.mock import MagicMock
+
+# Ensure tests run from the bot directory
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Stub websocket-client if not installed (allows tests to run without live deps)
+try:
+    import websocket
+except ImportError:
+    websocket = MagicMock()
+    sys.modules["websocket"] = websocket
+
+# Cross-platform temp dir (works on Windows, Linux, macOS)
+_TMPDIR = Path(tempfile.gettempdir())
+
+# Force DRY_RUN and DEMO for all tests -- must be set BEFORE importing engine/trader
+os.environ["DRY_RUN"]        = "true"
+os.environ["KALSHI_DEMO"]    = "true"
+os.environ["POSITIONS_FILE"] = str(_TMPDIR / "test_positions.json")
+os.environ["TRADES_FILE"]    = str(_TMPDIR / "test_trades.jsonl")
+os.environ["LOG_FILE"]       = str(_TMPDIR / "test_log.jsonl")
+
+import engine
+import trader
+
+# Override module-level Path constants captured at import time
+trader.TRADES_FILE = _TMPDIR / "test_trades.jsonl"
+engine.LOG_FILE    = _TMPDIR / "test_log.jsonl"
+
+
+# ==============================================================================
+# 1. Fee Formula Tests
+# ==============================================================================
+class TestFeeFormulas(unittest.TestCase):
+
+    def test_taker_fee_at_50(self):
+        """Max taker fee is 1.75c per contract at 50c."""
+        fee = engine.taker_fee_per_contract(50)
+        self.assertAlmostEqual(float(fee), 0.0175, places=6)
+
+    def test_maker_fee_at_50(self):
+        """Max maker fee is 0.4375c per contract at 50c."""
+        fee = engine.maker_fee_per_contract(50)
+        self.assertAlmostEqual(float(fee), 0.004375, places=6)
+
+    def test_taker_fee_at_10(self):
+        """Taker fee at 10c: 0.07 x 0.10 x 0.90 = 0.0063."""
+        fee = engine.taker_fee_per_contract(10)
+        self.assertAlmostEqual(float(fee), 0.0063, places=6)
+
+    def test_taker_fee_at_90(self):
+        """Taker fee at 90c == taker fee at 10c (symmetric)."""
+        fee_10 = engine.taker_fee_per_contract(10)
+        fee_90 = engine.taker_fee_per_contract(90)
+        self.assertAlmostEqual(float(fee_10), float(fee_90), places=6)
+
+    def test_maker_is_quarter_of_taker(self):
+        """Maker coef (0.0175) is exactly 1/4 of taker (0.07)."""
+        for p in [20, 35, 50, 65, 80]:
+            taker = engine.taker_fee_per_contract(p)
+            maker = engine.maker_fee_per_contract(p)
+            self.assertAlmostEqual(float(taker) / float(maker), 4.0, places=6,
+                                   msg=f"Ratio wrong at {p}c")
+
+    def test_total_taker_fee_rounds_up(self):
+        """Total fee is rounded UP to nearest cent."""
+        # 5 contracts at 50c: raw = 5 x 0.0175 = 0.0875 -> rounds up to 0.09
+        fee = engine.total_taker_fee(50, 5)
+        self.assertEqual(fee, Decimal("0.09"))
+
+    def test_total_maker_fee_rounds_up(self):
+        """Total maker fee rounds up."""
+        # 1 contract at 50c: raw = 0.004375 -> rounds up to 0.01
+        fee = engine.total_maker_fee(50, 1)
+        self.assertEqual(fee, Decimal("0.01"))
+
+    def test_arb_gap_no_profit_at_100(self):
+        """If yes_ask + no_ask = 100, taker gap is negative (fees eat profit)."""
+        gap = engine.arb_gap_cents(50, 50, 5, maker=False)
+        self.assertLess(float(gap), 0)
+
+    def test_arb_gap_profit_when_sum_low(self):
+        """If yes_ask + no_ask = 90, profit exists even after taker fees."""
+        gap = engine.arb_gap_cents(45, 45, 5, maker=False)
+        self.assertGreater(float(gap), 0)
+
+    def test_maker_gap_larger_than_taker_gap(self):
+        """Maker gap > taker gap since maker fees are lower."""
+        maker_gap = engine.arb_gap_cents(47, 47, 5, maker=True)
+        taker_gap = engine.arb_gap_cents(47, 47, 5, maker=False)
+        self.assertGreater(float(maker_gap), float(taker_gap))
+
+    def test_net_cost_components(self):
+        """net_cost_cents equals sum of YES + NO cost + both fees."""
+        yes_p, no_p, n = 48, 48, 5
+        cost = engine.net_cost_cents(yes_p, no_p, n, maker=True)
+        expected = (
+            Decimal(yes_p * n) / 100
+            + Decimal(no_p  * n) / 100
+            + engine.total_maker_fee(yes_p, n)
+            + engine.total_maker_fee(no_p,  n)
+        )
+        self.assertEqual(cost, expected)
+
+
+# ==============================================================================
+# 2. LocalBook Tests
+# ==============================================================================
+class TestLocalBook(unittest.TestCase):
+
+    def _make_book(self) -> engine.LocalBook:
+        book = engine.LocalBook("KXBTCD-15MIN-12345")
+        snapshot = {
+            "yes_dollars": [
+                ["0.4500", "20.00"],
+                ["0.4700", "10.00"],
+                ["0.4800", "5.00"],
+            ],
+            "no_dollars": [
+                ["0.4900", "15.00"],
+                ["0.5100", "8.00"],
+                ["0.5200", "3.00"],
+            ],
+        }
+        book.apply_snapshot(snapshot)
+        return book
+
+    def test_snapshot_populates_bids(self):
+        book = self._make_book()
+        self.assertTrue(book.ready)
+        self.assertIn(48, book.yes_bids)
+        self.assertIn(52, book.no_bids)
+
+    def test_best_yes_bid(self):
+        book = self._make_book()
+        self.assertEqual(book.best_yes_bid(), 48)
+
+    def test_best_no_bid(self):
+        book = self._make_book()
+        self.assertEqual(book.best_no_bid(), 52)
+
+    def test_implied_yes_ask(self):
+        """YES ask = 100 - best_NO_bid = 100 - 52 = 48."""
+        book = self._make_book()
+        self.assertEqual(book.best_yes_ask(), 48)
+
+    def test_implied_no_ask(self):
+        """NO ask = 100 - best_YES_bid = 100 - 48 = 52."""
+        book = self._make_book()
+        self.assertEqual(book.best_no_ask(), 52)
+
+    def test_spread_cents(self):
+        """Spread = YES_ask - YES_bid = 48 - 48 = 0."""
+        book = self._make_book()
+        self.assertEqual(book.spread_cents(), 0)
+
+    def test_mid(self):
+        """Mid = (YES_bid + YES_ask) / 2 = (48 + 48) / 2 = 48."""
+        book = self._make_book()
+        self.assertAlmostEqual(book.mid_cents(), 48.0)
+
+    def test_delta_add_level(self):
+        """Positive delta adds a new level."""
+        book = self._make_book()
+        book.apply_delta({"price_dollars": "0.4300", "delta_fp": "30.00", "side": "yes"})
+        self.assertIn(43, book.yes_bids)
+        self.assertAlmostEqual(book.yes_bids[43], 30.0)
+
+    def test_delta_remove_level(self):
+        """Delta that zeroes a level removes it."""
+        book = self._make_book()
+        book.apply_delta({"price_dollars": "0.4800", "delta_fp": "-5.00", "side": "yes"})
+        self.assertNotIn(48, book.yes_bids)
+
+    def test_delta_reduce_level(self):
+        """Partial reduction keeps the level with reduced count."""
+        book = self._make_book()
+        book.apply_delta({"price_dollars": "0.4800", "delta_fp": "-3.00", "side": "yes"})
+        self.assertIn(48, book.yes_bids)
+        self.assertAlmostEqual(book.yes_bids[48], 2.0)
+
+    def test_delta_invalid_price_ignored(self):
+        """Delta with price 0 or 100 is ignored."""
+        book = self._make_book()
+        count_before = len(book.yes_bids)
+        book.apply_delta({"price_dollars": "0.0000", "delta_fp": "10.00", "side": "yes"})
+        book.apply_delta({"price_dollars": "1.0000", "delta_fp": "10.00", "side": "yes"})
+        self.assertEqual(len(book.yes_bids), count_before)
+
+    def test_empty_book_returns_none(self):
+        book = engine.LocalBook("KXBTCD-15MIN-0")
+        self.assertIsNone(book.best_yes_bid())
+        self.assertIsNone(book.best_no_bid())
+        self.assertIsNone(book.best_yes_ask())
+        self.assertIsNone(book.best_no_ask())
+        self.assertIsNone(book.spread_cents())
+        self.assertIsNone(book.mid_cents())
+
+    def test_max_levels_cap(self):
+        """Book should not exceed MAX_LEVELS price levels."""
+        book = engine.LocalBook("KXBTCD-15MIN-0")
+        book.ready = True
+        for i in range(1, engine.LocalBook.MAX_LEVELS + 50):
+            if 1 <= i <= 99:
+                book.apply_delta({
+                    "price_dollars": f"{i/100:.2f}",
+                    "delta_fp": "10.00",
+                    "side": "yes",
+                })
+        self.assertLessEqual(len(book.yes_bids), engine.LocalBook.MAX_LEVELS)
+
+
+# ==============================================================================
+# 3. MarketSnapshot Tests
+# ==============================================================================
+class TestMarketSnapshot(unittest.TestCase):
+
+    def _make_snap(self, yes_bids, no_bids) -> engine.MarketSnapshot:
+        book = engine.LocalBook("KXBTCD-15MIN-12345")
+        book.yes_bids = yes_bids
+        book.no_bids  = no_bids
+        book.ready    = True
+        return engine.MarketSnapshot(
+            asset="BTC", ticker="KXBTCD-15MIN-12345",
+            book=book, window_ts=12345, secs_left=300
+        )
+
+    def test_no_arb_when_sum_100(self):
+        """When yes_ask + no_ask = 100, fees make it unprofitable."""
+        snap = self._make_snap(yes_bids={50: 10}, no_bids={50: 10})
+        self.assertEqual(snap.raw_sum, 100)
+        self.assertFalse(snap.is_arb)
+
+    def test_arb_gap_calculated_when_sum_low(self):
+        """Gap is calculated (not None) when sum < 100."""
+        # YES bid=48, NO bid=55 -> YES ask=45, NO ask=52, sum=97
+        snap = self._make_snap(yes_bids={48: 10}, no_bids={55: 10})
+        self.assertEqual(snap.yes_ask, 45)
+        self.assertEqual(snap.no_ask,  52)
+        self.assertEqual(snap.raw_sum, 97)
+        self.assertIsNotNone(snap.taker_gap)
+        self.assertIsNotNone(snap.maker_gap)
+
+    def test_to_dict_has_required_keys(self):
+        snap = self._make_snap(yes_bids={48: 10}, no_bids={52: 10})
+        d = snap.to_dict()
+        for key in ["asset", "ticker", "ts", "yes_bid", "no_bid",
+                    "yes_ask", "no_ask", "mid", "spread",
+                    "raw_sum", "gap_cents", "maker_gap", "taker_gap", "is_arb"]:
+            self.assertIn(key, d, f"Missing key: {key}")
+
+
+# ==============================================================================
+# 4. Auth Header Tests
+# ==============================================================================
+class TestAuthHeaders(unittest.TestCase):
+
+    def setUp(self):
+        self._orig_key_id   = engine.KALSHI_KEY_ID
+        self._orig_key_file = engine.KALSHI_KEY_FILE
+        engine.KALSHI_KEY_ID   = "test-key-id-123"
+        engine.KALSHI_KEY_FILE = str(_TMPDIR / "nonexistent_key.pem")
+        engine._private_key    = None
+
+    def tearDown(self):
+        engine.KALSHI_KEY_ID   = self._orig_key_id
+        engine.KALSHI_KEY_FILE = self._orig_key_file
+        engine._private_key    = None
+
+    def test_auth_headers_have_required_keys(self):
+        headers = engine._auth_headers("GET", "/trade-api/v2/portfolio/balance")
+        self.assertIn("KALSHI-ACCESS-KEY", headers)
+        self.assertIn("KALSHI-ACCESS-TIMESTAMP", headers)
+        self.assertIn("KALSHI-ACCESS-SIGNATURE", headers)
+        self.assertEqual(headers["KALSHI-ACCESS-KEY"], "test-key-id-123")
+
+    def test_timestamp_is_milliseconds(self):
+        headers = engine._auth_headers("POST", "/trade-api/v2/portfolio/orders")
+        ts = int(headers["KALSHI-ACCESS-TIMESTAMP"])
+        self.assertGreater(ts, 1_000_000_000_000)
+
+    def test_sign_strips_query_params(self):
+        """Signing must strip query params -- no exception even without key."""
+        sig = engine._sign(1234567890000, "GET", "/trade-api/v2/markets?status=open")
+        self.assertIsInstance(sig, str)
+
+
+# ==============================================================================
+# 5. Price Parsing Tests
+# ==============================================================================
+class TestPriceParsing(unittest.TestCase):
+
+    def test_parse_dollar_to_cents(self):
+        self.assertEqual(engine._parse_price("0.4800"), 48)
+        self.assertEqual(engine._parse_price("0.0100"), 1)
+        self.assertEqual(engine._parse_price("0.9900"), 99)
+
+    def test_parse_none(self):
+        self.assertIsNone(engine._parse_price(None))
+        self.assertIsNone(engine._parse_price("invalid"))
+
+    def test_cents_helper(self):
+        self.assertEqual(engine._cents("0.4800"), 48)
+        self.assertEqual(engine._cents("0.0500"), 5)
+        self.assertIsNone(engine._cents(None))
+
+    def test_market_ticker_format(self):
+        ts     = 1740000000
+        ticker = engine._market_ticker("BTC", ts)
+        self.assertEqual(ticker, f"KXBTC15M-{ts}")
+
+    def test_window_ts_is_multiple_of_900(self):
+        ts = engine._current_window_ts()
+        self.assertEqual(ts % 900, 0)
+
+
+# ==============================================================================
+# 6. QuoteManager Tests
+# ==============================================================================
+class TestQuoteManager(unittest.TestCase):
+
+    def _make_snap_with_mid(self, yes_bid, no_bid) -> engine.MarketSnapshot:
+        book = engine.LocalBook("KXBTCD-15MIN-12345")
+        book.yes_bids = {yes_bid: 100}
+        book.no_bids  = {no_bid: 100}
+        book.ready    = True
+        return engine.MarketSnapshot(
+            asset="BTC", ticker="KXBTCD-15MIN-12345",
+            book=book, window_ts=12345, secs_left=300
+        )
+
+    def test_yes_quote_target_in_valid_range(self):
+        mid  = 50.0
+        half = trader.SPREAD_TARGET_CENTS / 2
+        yes_target = max(1, round(mid - half))
+        self.assertGreaterEqual(yes_target, 1)
+        self.assertLessEqual(yes_target, 99)
+
+    def test_no_quote_target_in_valid_range(self):
+        mid  = 48.0
+        half = trader.SPREAD_TARGET_CENTS / 2
+        no_target = max(1, round((100 - mid) - half))
+        self.assertGreaterEqual(no_target, 1)
+        self.assertLessEqual(no_target, 99)
+
+    def test_requote_sets_last_mid(self):
+        """QuoteManager records last_mid on first update."""
+        qm   = trader.QuoteManager("BTC")
+        snap = self._make_snap_with_mid(50, 50)
+        mkt  = {
+            "ticker":     "KXBTCD-15MIN-12345",
+            "close_time": "2099-01-01T00:00:00Z",
+            "window_ts":  12345,
+        }
+        self.assertIsNone(qm._last_mid)
+        qm.update(snap, mkt)
+        self.assertIsNotNone(qm._last_mid)
+
+
+# ==============================================================================
+# 7. PositionBook Tests  (fully isolated -- no shared global state)
+# ==============================================================================
+class TestPositionBook(unittest.TestCase):
+
+    def _fresh_book(self) -> trader.PositionBook:
+        """Create a fresh PositionBook instance with in-memory state only."""
+        import threading
+        book = trader.PositionBook.__new__(trader.PositionBook)
+        book._lock = threading.Lock()
+        book._data = {
+            "open_orders": {},
+            "positions":   {},
+            "realised_pnl": 0.0,
+            "total_fills":  0,
+        }
+        book._save = lambda: None   # no-op: don't touch disk
+        return book
+
+    def test_initial_position_zero(self):
+        book = self._fresh_book()
+        self.assertEqual(book.yes_position("KXBTCD-15MIN-0"), 0)
+        self.assertEqual(book.no_position("KXBTCD-15MIN-0"), 0)
+
+    def test_record_fill_updates_position(self):
+        book = self._fresh_book()
+        book.record_fill("KXBTCD-15MIN-0", "yes", 48, 5, "cid-001")
+        self.assertEqual(book.yes_position("KXBTCD-15MIN-0"), 5)
+
+    def test_record_multiple_fills_avg_cost(self):
+        book = self._fresh_book()
+        book.record_fill("KXBTCD-15MIN-0", "yes", 48, 5, "cid-001")
+        book.record_fill("KXBTCD-15MIN-0", "yes", 50, 5, "cid-002")
+        pos = book._data["positions"]["KXBTCD-15MIN-0"]
+        self.assertEqual(pos["yes_contracts"], 10)
+        self.assertAlmostEqual(pos["avg_yes_cost"], 0.49, places=4)
+
+    def test_total_exposure(self):
+        book = self._fresh_book()
+        book.record_fill("KXBTCD-15MIN-0", "yes", 48, 5, "cid-001")
+        book.record_fill("KXBTCD-15MIN-0", "no",  52, 5, "cid-002")
+        self.assertEqual(book.total_exposure("KXBTCD-15MIN-0"), 10)
+
+    def test_record_open_order(self):
+        book = self._fresh_book()
+        book.record_open_order("cid-001", {
+            "asset": "BTC", "ticker": "KXBTCD-15MIN-0",
+            "side": "yes", "price_cents": 48, "count": 5,
+            "order_id": "oid-001", "ts": "2026-01-01T00:00:00Z",
+        })
+        orders = book.open_orders_for("KXBTCD-15MIN-0")
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["side"], "yes")
+
+    def test_remove_open_order(self):
+        book = self._fresh_book()
+        book.record_open_order("cid-001", {
+            "asset": "BTC", "ticker": "KXBTCD-15MIN-0",
+            "side": "yes", "price_cents": 48, "count": 5,
+            "order_id": "oid-001", "ts": "2026-01-01T00:00:00Z",
+        })
+        book.remove_open_order("cid-001")
+        self.assertEqual(book.open_orders_for("KXBTCD-15MIN-0"), [])
+
+    def test_fill_removes_open_order(self):
+        book = self._fresh_book()
+        book.record_open_order("cid-001", {
+            "asset": "BTC", "ticker": "KXBTCD-15MIN-0",
+            "side": "yes", "price_cents": 48, "count": 5,
+            "order_id": "oid-001", "ts": "2026-01-01T00:00:00Z",
+        })
+        book.record_fill("KXBTCD-15MIN-0", "yes", 48, 5, "cid-001")
+        self.assertEqual(book.open_orders_for("KXBTCD-15MIN-0"), [])
+
+
+# ==============================================================================
+# 8. Dry-Run Order Execution Tests
+# ==============================================================================
+class TestDryRunExecution(unittest.TestCase):
+
+    def setUp(self):
+        # Clean trades file before each test
+        tf = _TMPDIR / "test_trades.jsonl"
+        if tf.exists():
+            tf.unlink()
+        trader.TRADES_FILE = tf
+
+    def _make_arb_snap(self) -> engine.MarketSnapshot:
+        """Snapshot with gap: YES bid=48, NO bid=55 -> YES ask=45, NO ask=52, sum=97."""
+        book = engine.LocalBook("KXBTCD-15MIN-12345")
+        book.yes_bids = {48: 50}
+        book.no_bids  = {55: 50}
+        book.ready    = True
+        return engine.MarketSnapshot(
+            asset="BTC", ticker="KXBTCD-15MIN-12345",
+            book=book, window_ts=12345, secs_left=300
+        )
+
+    def test_dry_run_arb_status(self):
+        snap   = self._make_arb_snap()
+        mkt    = {"ticker": "KXBTCD-15MIN-12345",
+                  "close_time": "2099-01-01T00:00:00Z",
+                  "window_ts": 12345}
+        result = trader.execute_arb(snap, mkt)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["dry_run"])
+        self.assertIn(result["status"],
+                      ("dry_run", "skipped_no_gap", "skipped_no_price"))
+
+    def test_dry_run_maker_quote_yes(self):
+        result = trader.place_maker_quote("BTC", "KXBTCD-15MIN-12345", "yes", 48, 5)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["status"],       "dry_run")
+        self.assertEqual(result["price_cents"],  48)
+        self.assertEqual(result["n_contracts"],  5)
+        self.assertIn("maker_fee_dollars", result)
+        self.assertIn("client_order_id",   result)
+
+    def test_dry_run_maker_quote_no(self):
+        result = trader.place_maker_quote("BTC", "KXBTCD-15MIN-12345", "no", 52, 5)
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(result["side"],   "no")
+
+    def test_dry_run_logs_to_trades_file(self):
+        trader.place_maker_quote("BTC", "KXBTCD-15MIN-12345", "yes", 48, 5)
+        tf = trader.TRADES_FILE
+        self.assertTrue(tf.exists(), f"Trades file not created at {tf}")
+        lines = tf.read_text().strip().splitlines()
+        self.assertGreater(len(lines), 0)
+        entry = json.loads(lines[-1])
+        self.assertIn("asset",  entry)
+        self.assertIn("status", entry)
+
+
+# ==============================================================================
+# 9. BotEngine Callback Tests (no real WS)
+# ==============================================================================
+class TestBotEngineCallbacks(unittest.TestCase):
+
+    def test_engine_initializes_and_stops(self):
+        bot = engine.BotEngine(
+            on_log    = lambda i, m: None,
+            on_prices = lambda m, s: None,
+            on_arb    = lambda snap: None,
+            on_status = lambda s: None,
+        )
+        self.assertIsNotNone(bot)
+        self.assertIsInstance(bot.markets, dict)
+        self.assertEqual(bot.update_count, 0)
+        bot.stop()
+        self.assertFalse(bot.is_running())
+
+    def test_compute_and_push_sets_snapshot(self):
+        bot = engine.BotEngine(
+            on_log=lambda i, m: None, on_prices=lambda m, s: None,
+            on_arb=lambda s: None,    on_status=lambda s: None,
+        )
+        ticker = "KXBTCD-15MIN-12345"
+        book   = engine.LocalBook(ticker)
+        book.yes_bids = {55: 100}
+        book.no_bids  = {55: 100}
+        book.ready    = True
+        bot.markets["BTC"] = {
+            "asset": "BTC", "ticker": ticker, "window_ts": 12345,
+            "close_time": "2099-01-01T00:00:00Z", "secs_left": 300, "tick_size": 1,
+        }
+        bot._books[ticker]      = book
+        bot._ticker_map[ticker] = "BTC"
+        bot._snapshots["BTC"]   = None
+
+        bot._compute_and_push("BTC")
+
+        snap = bot._snapshots.get("BTC")
+        self.assertIsNotNone(snap)
+        # YES ask = 100 - 55 = 45, NO ask = 100 - 55 = 45
+        self.assertEqual(snap.yes_ask, 45)
+        self.assertEqual(snap.no_ask,  45)
+        self.assertEqual(snap.raw_sum, 90)
+
+    def test_arb_dedup_no_double_fire(self):
+        """Same (yes_ask, no_ask) pair fires on_arb only once."""
+        arbs = []
+        bot  = engine.BotEngine(
+            on_log=lambda i, m: None, on_prices=lambda m, s: None,
+            on_arb=lambda s: arbs.append(s), on_status=lambda s: None,
+        )
+        ticker = "KXBTCD-15MIN-12345"
+        book   = engine.LocalBook(ticker)
+        book.yes_bids = {55: 100}
+        book.no_bids  = {55: 100}
+        book.ready    = True
+        bot.markets["BTC"] = {
+            "asset": "BTC", "ticker": ticker, "window_ts": 12345,
+            "close_time": "2099-01-01T00:00:00Z", "secs_left": 300, "tick_size": 1,
+        }
+        bot._books[ticker]      = book
+        bot._ticker_map[ticker] = "BTC"
+
+        bot._compute_and_push("BTC")
+        bot._compute_and_push("BTC")  # same prices -- should NOT fire again
+
+        self.assertLessEqual(len(arbs), 1)
+
+
+# ==============================================================================
+# Shared helper — arb-quality snapshot used by multiple test classes
+# ==============================================================================
+def _make_arb_snap() -> engine.MarketSnapshot:
+    """
+    YES bid=55, NO bid=55  →  YES ask=45, NO ask=45, raw_sum=90.
+    taker_gap ≈ +6.4c per pair — definitively profitable after fees.
+    """
+    book = engine.LocalBook("KXBTCD-15MIN-12345")
+    book.yes_bids = {55: 50}
+    book.no_bids  = {55: 50}
+    book.ready    = True
+    return engine.MarketSnapshot(
+        asset="BTC", ticker="KXBTCD-15MIN-12345",
+        book=book, window_ts=12345, secs_left=300,
+    )
+
+_ARB_MKT = {"ticker": "KXBTCD-15MIN-12345",
+            "close_time": "2099-01-01T00:00:00Z",
+            "window_ts": 12345}
+
+
+# ==============================================================================
+# 10. ArbStats Tests
+# ==============================================================================
+class TestArbStats(unittest.TestCase):
+
+    def test_initial_state_all_zeros(self):
+        s = engine.ArbStats("BTC")
+        self.assertEqual(s.raw_gap_count, 0)
+        self.assertEqual(s.profitable_count, 0)
+        self.assertEqual(s.avg_gap, 0.0)
+        self.assertEqual(s.max_gap, 0.0)
+        self.assertIsNone(s.last_gap)
+        self.assertIsNone(s.last_ts)
+
+    def test_record_profitable_gap(self):
+        s = engine.ArbStats("BTC")
+        s.record(raw_gap=2.5, taker_gap=1.0)
+        self.assertEqual(s.raw_gap_count, 1)
+        self.assertEqual(s.profitable_count, 1)
+        self.assertAlmostEqual(s.avg_gap, 2.5)
+        self.assertEqual(s.max_gap, 2.5)
+        self.assertEqual(s.last_gap, 2.5)
+        self.assertIsNotNone(s.last_ts)
+
+    def test_record_non_profitable_gap(self):
+        """raw_gap exists (combined < 100) but taker_gap negative (fees eat profit)."""
+        s = engine.ArbStats("ETH")
+        s.record(raw_gap=0.5, taker_gap=-0.1)
+        self.assertEqual(s.raw_gap_count, 1)
+        self.assertEqual(s.profitable_count, 0)
+
+    def test_avg_gap_over_multiple_records(self):
+        s = engine.ArbStats("SOL")
+        s.record(2.0, 1.0)
+        s.record(4.0, 2.0)
+        self.assertAlmostEqual(s.avg_gap, 3.0)
+
+    def test_max_gap_tracks_highest(self):
+        s = engine.ArbStats("BTC")
+        s.record(1.0, 0.5)
+        s.record(5.0, 3.0)
+        s.record(3.0, 1.0)
+        self.assertEqual(s.max_gap, 5.0)
+
+    def test_capture_rate_100pct(self):
+        s = engine.ArbStats("BTC")
+        s.record(2.0, 1.0)
+        s.record(3.0, 0.5)
+        self.assertAlmostEqual(s.capture_rate, 100.0)
+
+    def test_capture_rate_50pct(self):
+        s = engine.ArbStats("BTC")
+        s.record(2.0, 1.0)    # profitable
+        s.record(0.5, -0.1)   # not profitable
+        self.assertAlmostEqual(s.capture_rate, 50.0)
+
+    def test_capture_rate_zero_when_no_records(self):
+        s = engine.ArbStats("BTC")
+        self.assertEqual(s.capture_rate, 0.0)
+
+    def test_gaps_per_hour_positive(self):
+        s = engine.ArbStats("BTC")
+        s.record(1.0, 0.5)
+        self.assertGreater(s.gaps_per_hour, 0.0)
+
+    def test_to_dict_has_all_keys(self):
+        s = engine.ArbStats("ETH")
+        d = s.to_dict()
+        for key in ["asset", "raw_gap_count", "profitable_count",
+                    "avg_gap", "max_gap", "last_gap", "last_ts",
+                    "gaps_per_hour", "capture_rate"]:
+            self.assertIn(key, d, f"Missing key: {key}")
+
+    def test_bot_engine_exposes_arb_stats(self):
+        """BotEngine.get_arb_stats() returns a dict keyed by asset."""
+        bot = engine.BotEngine(
+            on_log=lambda i, m: None, on_prices=lambda m, s: None,
+            on_arb=lambda s: None,    on_status=lambda s: None,
+        )
+        stats = bot.get_arb_stats()
+        self.assertIsInstance(stats, dict)
+        for asset in engine.ASSETS:
+            self.assertIn(asset, stats)
+            self.assertIn("raw_gap_count", stats[asset])
+
+
+# ==============================================================================
+# 11. Guardrail Tests
+# ==============================================================================
+def _reset_guardrails():
+    """Helper: wipe all guardrail state between tests."""
+    import threading
+    trader._halt_trading.clear()
+    trader._asset_cooldowns.clear()
+    trader._session_start_pnl = None
+    # Rebuild semaphore to ensure it is at full count
+    trader._ARB_LOCK = threading.Semaphore(trader.MAX_CONCURRENT_ORDERS)
+
+
+class TestGuardrails(unittest.TestCase):
+
+    def setUp(self):
+        _reset_guardrails()
+        trader.DRY_RUN = True      # keep tests safe
+        trader.TRADES_FILE = _TMPDIR / "test_trades.jsonl"
+        trader.POSITIONS._data["positions"].pop(_ARB_MKT["ticker"], None)
+
+    def tearDown(self):
+        _reset_guardrails()
+        trader.POSITIONS._data["positions"].pop(_ARB_MKT["ticker"], None)
+
+    # ── cooldown ────────────────────────────────────────────────────────────────
+
+    def test_check_cooldown_allows_fresh_asset(self):
+        self.assertIsNone(trader._check_cooldown("BTC"))
+
+    def test_arm_then_check_blocks(self):
+        trader._arm_cooldown("BTC")
+        self.assertEqual(trader._check_cooldown("BTC"), "cooldown")
+
+    def test_cooldown_expires(self):
+        """Once the cooldown window passes, execution is re-allowed."""
+        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
+        self.assertIsNone(trader._check_cooldown("BTC"))
+
+    def test_cooldown_is_per_asset(self):
+        """Cooldown on BTC does NOT affect ETH."""
+        trader._arm_cooldown("BTC")
+        self.assertIsNone(trader._check_cooldown("ETH"))
+
+    # ── circuit breaker ─────────────────────────────────────────────────────────
+
+    def test_halted_flag_blocks_all_assets(self):
+        trader._halt_trading.set()
+        for asset in ["BTC", "ETH", "SOL"]:
+            self.assertEqual(trader._check_cooldown(asset), "circuit_breaker")
+
+    def test_reset_halt_clears_flag(self):
+        trader._halt_trading.set()
+        trader.reset_halt()
+        self.assertFalse(trader._halt_trading.is_set())
+        self.assertIsNone(trader._check_cooldown("BTC"))
+
+    def test_reset_halt_also_clears_pnl_baseline(self):
+        trader._session_start_pnl = 5.0
+        trader.reset_halt()
+        self.assertIsNone(trader._session_start_pnl)
+
+    # ── guardrail status ────────────────────────────────────────────────────────
+
+    def test_get_guardrail_status_keys(self):
+        status = trader.get_guardrail_status()
+        for key in ["halted", "cooldowns", "cooldown_secs", "max_concurrent", "max_daily_loss"]:
+            self.assertIn(key, status)
+
+    def test_get_guardrail_status_not_halted_by_default(self):
+        self.assertFalse(trader.get_guardrail_status()["halted"])
+
+    def test_get_guardrail_status_shows_active_cooldown(self):
+        trader._arm_cooldown("SOL")
+        status = trader.get_guardrail_status()
+        self.assertIn("SOL", status["cooldowns"])
+        self.assertGreater(status["cooldowns"]["SOL"], 0)
+
+    def test_get_guardrail_status_cooldown_absent_after_expiry(self):
+        trader._asset_cooldowns["ETH"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
+        status = trader.get_guardrail_status()
+        self.assertNotIn("ETH", status["cooldowns"])
+
+    # ── execute_arb integration ──────────────────────────────────────────────────
+
+    def test_execute_arb_skipped_when_on_cooldown(self):
+        trader._arm_cooldown("BTC")
+        result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
+        self.assertEqual(result["status"], "skipped_cooldown")
+
+    def test_execute_arb_skipped_when_halted(self):
+        trader._halt_trading.set()
+        result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
+        self.assertEqual(result["status"], "skipped_circuit_breaker")
+
+    def test_execute_arb_dry_run_after_cooldown_expires(self):
+        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
+        result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
+        self.assertEqual(result["status"], "dry_run")
+
+    def test_execute_arb_dry_run_arms_cooldown(self):
+        """Successful dry_run execution arms per-asset cooldown."""
+        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
+        trader.execute_arb(_make_arb_snap(), _ARB_MKT)
+        self.assertIn("BTC", trader._asset_cooldowns)
+        # Second call is now blocked
+        result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
+        self.assertEqual(result["status"], "skipped_cooldown")
+
+    def test_execute_arb_skipped_when_semaphore_full(self):
+        """When MAX_CONCURRENT_ORDERS slots are taken, further calls are skipped."""
+        acquired = trader._ARB_LOCK.acquire(blocking=False)
+        self.assertTrue(acquired, "Semaphore should be free at test start")
+        try:
+            result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
+            self.assertEqual(result["status"], "skipped_max_concurrent")
+        finally:
+            trader._ARB_LOCK.release()
+
+    def test_semaphore_released_after_dry_run(self):
+        """Semaphore must be back to full count after a completed dry_run."""
+        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
+        trader.execute_arb(_make_arb_snap(), _ARB_MKT)
+        # Semaphore should be acquirable again (try non-blocking)
+        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
+        acquired = trader._ARB_LOCK.acquire(blocking=False)
+        self.assertTrue(acquired, "Semaphore not released after execute_arb returned")
+        trader._ARB_LOCK.release()
+
+    def test_execute_arb_skipped_near_expiry(self):
+        """Snap with secs_left < MIN_SECS_LEFT is skipped."""
+        snap = _make_arb_snap()
+        snap.secs_left = trader.MIN_SECS_LEFT - 1
+        result = trader.execute_arb(snap, _ARB_MKT)
+        self.assertEqual(result["status"], "skipped_near_expiry")
+
+    def test_execute_arb_skipped_when_no_depth(self):
+        """Snap with zero depth on either side is skipped before placing any order."""
+        snap = _make_arb_snap()
+        snap.yes_ask_depth = 0   # simulate empty book on YES side
+        result = trader.execute_arb(snap, _ARB_MKT)
+        self.assertEqual(result["status"], "skipped_no_depth")
+
+    def test_execute_arb_not_called_for_illiquid_snap(self):
+        """Snaps outside liquid price range have is_arb=False, so on_arb never fires."""
+        book = engine.LocalBook("KXBTCD-15MIN-TEST")
+        # YES bid=5 → YES ask=95 (illiquid high), NO bid=95 → NO ask=5 (illiquid low)
+        book.yes_bids = {5: 10}
+        book.no_bids  = {95: 10}
+        book.ready    = True
+        snap = engine.MarketSnapshot("BTC", "KXBTCD-15MIN-TEST", book, 0, 300)
+        self.assertFalse(snap.is_arb,
+                         "is_arb must be False when prices are outside liquid range")
+
+    def _run_live_arb(self, yes_response, no_response,
+                      unwind_yes_response=None, unwind_no_response=None):
+        """
+        Helper: temporarily disable DRY_RUN and mock _post_order to exercise
+        the live-order path of execute_arb (concurrent YES+NO placement).
+
+        Dispatches by body['side'] + body['action'] so thread order doesn't matter.
+        """
+        import unittest.mock as mock
+        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
+
+        def fake_post(body):
+            side   = body.get("side")
+            action = body.get("action", "buy")
+            if action == "sell":
+                resp = unwind_yes_response if side == "yes" else unwind_no_response
+            elif side == "yes":
+                resp = yes_response
+            else:
+                resp = no_response
+            if isinstance(resp, Exception):
+                raise resp
+            return resp if resp is not None else {"order": {}}
+
+        ticker = _ARB_MKT["ticker"]
+        trader.POSITIONS._data["positions"].pop(ticker, None)
+
+        orig_dry = trader.DRY_RUN
+        try:
+            trader.DRY_RUN = False
+            with mock.patch.object(trader, "_post_order", side_effect=fake_post):
+                with mock.patch.object(trader, "_log_trade"):
+                    return trader.execute_arb(_make_arb_snap(), _ARB_MKT)
+        finally:
+            trader.DRY_RUN = orig_dry
+            trader.POSITIONS._data["positions"].pop(ticker, None)
+
+    def test_live_arb_both_legs_filled(self):
+        """Both YES and NO IOC fill → status 'filled'."""
+        yes_resp = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "5.00"}}
+        no_resp  = {"order": {"order_id": "n1", "status": "executed", "fill_count_fp": "5.00"}}
+        result = self._run_live_arb(yes_resp, no_resp)
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(result["n"], 5)
+
+    def test_live_arb_both_legs_miss_returns_error(self):
+        """Both YES and NO IOC canceled (book moved) → status 'error', no unhedged."""
+        yes_resp = {"order": {"order_id": "y1", "status": "canceled", "fill_count_fp": "0"}}
+        no_resp  = {"order": {"order_id": "n1", "status": "canceled", "fill_count_fp": "0"}}
+        result = self._run_live_arb(yes_resp, no_resp)
+        self.assertEqual(result["status"], "error")
+
+    def test_live_arb_yes_fills_no_misses_unwind_ok(self):
+        """YES fills, NO misses → unwind YES succeeds → status 'unwound_partial'."""
+        yes_resp    = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "5.00"}}
+        no_resp     = {"order": {"order_id": "n1", "status": "canceled",  "fill_count_fp": "0"}}
+        unwind_resp = {"order": {"order_id": "u1", "status": "executed", "fill_count_fp": "5.00"}}
+        result = self._run_live_arb(yes_resp, no_resp, unwind_yes_response=unwind_resp)
+        self.assertEqual(result["status"], "unwound_partial")
+
+    def test_live_arb_yes_fills_no_misses_unwind_fails(self):
+        """YES fills, NO misses, unwind also fails → status 'partial_unhedged'."""
+        yes_resp    = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "5.00"}}
+        no_resp     = {"order": {"order_id": "n1", "status": "canceled",  "fill_count_fp": "0"}}
+        unwind_resp = {"order": {"order_id": "u1", "status": "canceled",  "fill_count_fp": "0"}}
+        result = self._run_live_arb(yes_resp, no_resp, unwind_yes_response=unwind_resp)
+        self.assertEqual(result["status"], "partial_unhedged")
+
+    def test_live_arb_yes_fills_no_misses_unwind_exception(self):
+        """YES fills, NO misses, unwind raises → status 'partial_unhedged'."""
+        yes_resp = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "5.00"}}
+        no_resp  = {"order": {"order_id": "n1", "status": "canceled",  "fill_count_fp": "0"}}
+        result   = self._run_live_arb(yes_resp, no_resp,
+                                      unwind_yes_response=Exception("timeout"))
+        self.assertEqual(result["status"], "partial_unhedged")
+
+    def test_live_arb_partial_fills_hedged_minimum(self):
+        """YES=3, NO=5 → hedged=3, NO excess=2 unwound → status 'filled' with n=3."""
+        yes_resp    = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "3.00"}}
+        no_resp     = {"order": {"order_id": "n1", "status": "executed", "fill_count_fp": "5.00"}}
+        unwind_resp = {"order": {"order_id": "u1", "status": "executed", "fill_count_fp": "2.00"}}
+        result = self._run_live_arb(yes_resp, no_resp, unwind_no_response=unwind_resp)
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(result["n"], 3)
+
+
+# ==============================================================================
+# 12. Live-Readiness Checklist
+# ==============================================================================
+class TestLiveReadiness(unittest.TestCase):
+    """
+    Validates all prerequisites needed before flipping DRY_RUN=false.
+    These tests are safe to run at any time — no network calls, no orders.
+    """
+
+    def test_api_base_is_demo_when_demo_mode(self):
+        """In KALSHI_DEMO=true mode, API_BASE must point to the demo host."""
+        if engine.USE_DEMO:
+            self.assertIn("demo", engine.API_BASE,
+                          f"API_BASE={engine.API_BASE!r} but USE_DEMO=True — "
+                          "orders would hit the live API with demo credentials!")
+
+    def test_api_base_is_live_when_live_mode(self):
+        """In KALSHI_DEMO=false mode, API_BASE must point to the live host."""
+        if not engine.USE_DEMO:
+            self.assertIn("elections.kalshi.com", engine.API_BASE,
+                          f"API_BASE={engine.API_BASE!r} but USE_DEMO=False")
+
+    def test_ws_url_matches_demo_flag(self):
+        if engine.USE_DEMO:
+            self.assertIn("demo", engine.WS_URL)
+        else:
+            self.assertIn("elections.kalshi.com", engine.WS_URL)
+
+    def test_key_id_is_set(self):
+        key_id = os.getenv("KALSHI_KEY_ID", "")
+        self.assertTrue(key_id, "KALSHI_KEY_ID not set in .env — cannot authenticate")
+
+    def test_rsa_key_file_loads(self):
+        """Key file exists and parses as a valid RSA private key."""
+        actual_key_file = os.getenv("KALSHI_KEY_FILE", "kalshi.key")
+        if not Path(actual_key_file).exists():
+            self.skipTest(
+                f"RSA key file not present ({actual_key_file!r}) — "
+                "download from Kalshi account → API Keys and save as kalshi.key"
+            )
+        orig = engine.KALSHI_KEY_FILE
+        engine.KALSHI_KEY_FILE = actual_key_file
+        engine._private_key    = None
+        try:
+            key = engine._load_key()
+            self.assertIsNotNone(key, "Key file found but failed to load — check PEM format")
+        finally:
+            engine.KALSHI_KEY_FILE = orig
+            engine._private_key    = None
+
+    def test_auth_signature_is_non_empty_when_key_absent(self):
+        """_sign returns empty string (not an exception) when key file is missing."""
+        engine._private_key = None
+        original_key_file = engine.KALSHI_KEY_FILE
+        engine.KALSHI_KEY_FILE = str(_TMPDIR / "no_such_key.pem")
+        try:
+            sig = engine._sign(int(time.time() * 1000), "GET", "/trade-api/v2/markets")
+            self.assertIsInstance(sig, str)   # no exception, graceful empty string
+        finally:
+            engine.KALSHI_KEY_FILE = original_key_file
+            engine._private_key    = None
+
+    def test_fee_formula_vs_known_values(self):
+        """Regression: verify fee constants match the official Kalshi fee schedule."""
+        # At 50c: taker = 0.07 * 0.50 * 0.50 = 0.0175 per contract
+        self.assertAlmostEqual(float(engine.taker_fee_per_contract(50)), 0.0175, places=6)
+        # At 50c: maker = 0.0175 * 0.50 * 0.50 = 0.004375 per contract
+        self.assertAlmostEqual(float(engine.maker_fee_per_contract(50)), 0.004375, places=6)
+
+    def test_guardrail_defaults_are_sensible(self):
+        """Config defaults protect against runaway live trading."""
+        self.assertGreater(trader.ARB_COOLDOWN_SECS, 0,
+                           "ARB_COOLDOWN_SECS must be > 0")
+        self.assertGreaterEqual(trader.MAX_CONCURRENT_ORDERS, 1)
+        self.assertGreater(trader.MAX_DAILY_LOSS_USD, 0,
+                           "MAX_DAILY_LOSS_USD must be > 0 to act as a stop")
+
+    def test_dry_run_is_on_in_test_environment(self):
+        """Confirm DRY_RUN is forced true in the test suite."""
+        self.assertTrue(engine.DRY_RUN,
+                        "DRY_RUN is False during test run — this is unsafe")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

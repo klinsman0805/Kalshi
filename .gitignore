@@ -1,0 +1,15 @@
+# Secrets — NEVER commit these
+.env
+*.key
+*.pem
+
+# Runtime data
+positions.json
+*.jsonl
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local environment
+venv/
+.claude/
