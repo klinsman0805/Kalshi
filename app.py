@@ -644,8 +644,9 @@ const S = {
 };
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
-let es = null;
+let es = null, _sseEnabled = true;
 function connectSSE() {
+  _sseEnabled = true;
   if (es) try { es.close(); } catch(e) {}
   es = new EventSource('/stream');
   es.onopen = () => {
@@ -655,7 +656,7 @@ function connectSSE() {
   es.onerror = () => {
     document.getElementById('conn-dot').classList.remove('live');
     document.getElementById('conn-label').textContent = 'Reconnecting…';
-    setTimeout(connectSSE, 3000);
+    if (_sseEnabled) setTimeout(connectSSE, 3000);
   };
   es.onmessage = e => handleMsg(JSON.parse(e.data));
 }
@@ -1039,10 +1040,28 @@ function renderTrades(trades) {
 // ── Bot controls ──────────────────────────────────────────────────────────────
 async function startBot() {
   S.startedAt = new Date().toISOString();
+  // Flip UI immediately; SSE status event will confirm final state
+  document.getElementById('btn-start').style.display = 'none';
+  document.getElementById('btn-stop').style.display  = '';
+  document.getElementById('slabel').textContent = 'STARTING';
+  document.getElementById('sdot').className = 'sdot disc';
   await fetch('/api/start', {method:'POST'});
+  connectSSE();   // (re)open data stream
 }
 async function stopBot() {
   S.startedAt = null;
+  S.botRunning = false;
+  S.lastPriceTs = 0;  // data dot goes red immediately
+  // Flip UI immediately
+  document.getElementById('btn-stop').style.display  = 'none';
+  document.getElementById('btn-start').style.display = '';
+  document.getElementById('slabel').textContent = 'STOPPED';
+  document.getElementById('sdot').className = 'sdot';
+  // Close SSE so price ticks stop arriving; suppress auto-reconnect
+  _sseEnabled = false;
+  if (es) { try { es.close(); } catch(e) {} es = null; }
+  document.getElementById('conn-dot').classList.remove('live');
+  document.getElementById('conn-label').textContent = 'Disconnected';
   await fetch('/api/stop', {method:'POST'});
 }
 
