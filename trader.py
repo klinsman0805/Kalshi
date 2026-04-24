@@ -367,40 +367,60 @@ def cancel_all_for_ticker(ticker: str):
 
 # ── Arb execution helpers ─────────────────────────────────────────────────────
 def _unwind(asset: str, ticker: str, snap, side: str, count: int, entry_price: int) -> bool:
-    """Aggressively sell back an unhedged position via IOC. Returns True if fully filled."""
+    """
+    Sell back an unhedged leg via IOC with three escalating price attempts.
+
+    Attempt 1: bid − SWEEP_CENTS          (best-effort, preserves most value)
+    Attempt 2: bid − SWEEP_CENTS * 4      (wider sweep if book moved)
+    Attempt 3: price = 1¢                 (nuclear — accepts any fill to close the position)
+
+    Using stale bid from the snapshot is intentional for attempt 1; attempts 2/3
+    are aggressive enough to overcome any reasonable post-order book movement.
+    """
     if side == "yes":
         ref_bid     = snap.yes_bid or entry_price
         price_field = "yes_price"
     else:
         ref_bid     = snap.no_bid or entry_price
         price_field = "no_price"
-    unwind_price = max(1, ref_bid - SWEEP_CENTS)
-    unwind_cid   = _make_client_id(asset, f"{side}-unwind")
-    try:
-        uw_resp   = _post_order({
-            "ticker":          ticker,
-            "side":            side,
-            "action":          "sell",
-            "count":           count,
-            price_field:       unwind_price,
-            "time_in_force":   "immediate_or_cancel",
-            "client_order_id": unwind_cid,
-        })
-        uw_order  = uw_resp.get("order", {})
-        uw_filled = int(float(uw_order.get("fill_count_fp", "0") or "0"))
-        remaining = count - uw_filled
-        if remaining > 0:
-            log.error("UNHEDGED %s %s: unwind only %d/%d — recording %d open on %s",
-                      asset, side.upper(), uw_filled, count, remaining, ticker)
-            POSITIONS.record_fill(ticker, side, entry_price, remaining, unwind_cid)
-            return False
-        log.warning("↩ %s %s unwind OK: sold %d @ %d¢", asset, side.upper(), count, unwind_price)
-        return True
-    except Exception as e:
-        log.error("UNHEDGED %s %s: unwind error (%s) — recording %d open on %s",
-                  asset, side.upper(), e, count, ticker)
-        POSITIONS.record_fill(ticker, side, entry_price, count, unwind_cid)
+
+    remaining = count
+    # Prices for each attempt: escalate to 1¢ (nuclear) on the last try
+    for attempt, price in enumerate([
+        max(1, ref_bid - SWEEP_CENTS),
+        max(1, ref_bid - SWEEP_CENTS * 4),
+        1,
+    ]):
+        if remaining <= 0:
+            break
+        cid = _make_client_id(asset, f"{side}-unwind-{attempt}")
+        try:
+            resp   = _post_order({
+                "ticker":          ticker,
+                "side":            side,
+                "action":          "sell",
+                "count":           remaining,
+                price_field:       price,
+                "time_in_force":   "immediate_or_cancel",
+                "client_order_id": cid,
+            })
+            filled    = int(float(resp.get("order", {}).get("fill_count_fp", "0") or "0"))
+            remaining -= filled
+            log.warning("↩ unwind attempt %d  %s %s  price=%d¢  filled=%d/%d  left=%d",
+                        attempt + 1, asset, side.upper(), price, filled, count, remaining)
+        except Exception as e:
+            log.error("↩ unwind attempt %d  %s %s  error: %s", attempt + 1, asset, side.upper(), e)
+
+    if remaining > 0:
+        # All three attempts exhausted — record the remaining contracts as an open position
+        log.error("UNHEDGED %s %s: %d/%d contracts not unwound — recorded in positions",
+                  asset, side.upper(), remaining, count)
+        POSITIONS.record_fill(ticker, side, entry_price, remaining,
+                              _make_client_id(asset, f"{side}-unhedged"))
         return False
+
+    log.warning("↩ %s %s fully unwound (%d contracts)", asset, side.upper(), count)
+    return True
 
 
 # ── Arb execution (taker orders) ──────────────────────────────────────────────
