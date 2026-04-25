@@ -669,16 +669,17 @@ class QuoteManager:
       - Cancel + replace when mid moves > REQUOTE_THRESHOLD cents
       - Cancel all when market expires
     """
-    def __init__(self, asset: str):
+    def __init__(self, asset: str, on_log=None):
         self.asset            = asset
         self._lock            = threading.Lock()
         self._yes_quote: Optional[dict] = None
         self._no_quote:  Optional[dict] = None
         self._last_mid:  Optional[float] = None
         self._current_ticker: Optional[str] = None
-        self._last_place_ts: float = 0.0   # time of last placement attempt
-        self._yes_at_cross:  bool  = False  # YES bid crossed book — wait for mid move
-        self._no_at_cross:   bool  = False  # NO  bid crossed book — wait for mid move
+        self._last_place_ts: float = 0.0
+        self._yes_at_cross:  bool  = False
+        self._no_at_cross:   bool  = False
+        self._on_log = on_log or (lambda icon, msg: None)
 
     def update(self, snap, mkt: dict):
         """
@@ -750,18 +751,24 @@ class QuoteManager:
                                       yes_bid_target, TRADE_SIZE_CONTRACTS)
                 if r.get("status") == "at_cross":
                     self._yes_at_cross = True
+                    self._on_log("~", f"MAKER {self.asset} YES {yes_bid_target}¢ at_cross — retrying on next mid move")
                 elif r.get("status") not in ("error",):
                     self._yes_quote    = r
                     self._yes_at_cross = False
+                else:
+                    self._on_log("!", f"MAKER {self.asset} YES failed: {r.get('error','')}")
 
             if no_pos < MAX_POSITION_CONTRACTS:
                 r = place_maker_quote(self.asset, ticker, "no",
                                       no_bid_target, TRADE_SIZE_CONTRACTS)
                 if r.get("status") == "at_cross":
                     self._no_at_cross = True
+                    self._on_log("~", f"MAKER {self.asset} NO {no_bid_target}¢ at_cross — retrying on next mid move")
                 elif r.get("status") not in ("error",):
                     self._no_quote    = r
                     self._no_at_cross = False
+                else:
+                    self._on_log("!", f"MAKER {self.asset} NO failed: {r.get('error','')}")
 
     def cancel_all(self, ticker: str):
         """Cancel all quotes (call on market expiry)."""

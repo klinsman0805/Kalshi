@@ -51,7 +51,7 @@ app.config["SECRET_KEY"] = os.urandom(24)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _bot: engine.BotEngine = None
-_quote_managers = {a: trader.QuoteManager(a) for a in engine.ASSETS}
+_quote_managers = {a: trader.QuoteManager(a, on_log=lambda ic, msg: _add_log(ic, msg)) for a in engine.ASSETS}
 _sse_clients: list = []
 _sse_lock = threading.Lock()
 _event_queue: queue.Queue = queue.Queue(maxsize=500)
@@ -542,6 +542,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
 .le-msg.err{color:var(--down)}
 .le-msg.ok{color:var(--ok)}
 .le-msg.dim{color:var(--muted)}
+.le-msg.warn{color:var(--warn)}
+.le-msg.cross{color:var(--arb);opacity:.7}
 
 /* ── Arb signals ── */
 .sig-empty{color:var(--muted);font-size:11px;text-align:center;padding:32px 16px;line-height:1.9}
@@ -1041,7 +1043,7 @@ function clearAll() {
 
 // ── Log panel ─────────────────────────────────────────────────────────────────
 function addLog(e) {
-  const cls = e.icon==='⚡'?'arb':e.icon==='✗'?'err':e.icon==='✅'?'ok':e.icon==='→'?'dim':'';
+  const cls = e.icon==='⚡'?'arb':e.icon==='✗'?'err':e.icon==='✅'?'ok':e.icon==='→'?'dim':e.icon==='!'?'warn':e.icon==='~'?'cross':'';
   const body = document.getElementById('log-body');
   const d = document.createElement('div');
   d.className = 'log-entry';
