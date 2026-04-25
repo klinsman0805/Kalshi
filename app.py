@@ -31,6 +31,7 @@ except ImportError:
 
 os.environ.setdefault("DRY_RUN",     "true")   # safe fallback if .env omits it
 os.environ.setdefault("KALSHI_DEMO", "false")  # default to live API if .env omits it
+os.environ.setdefault("MAKER_MODE", "false")   # false = arb | true = maker
 
 # Stub websocket if not installed so app still loads
 try:
@@ -60,6 +61,7 @@ BOT_STATE = {
     "status":          "stopped",
     "dry_run":         os.getenv("DRY_RUN", "true").lower() != "false",
     "demo":            os.getenv("KALSHI_DEMO", "true").lower() != "false",
+    "maker_mode":      os.getenv("MAKER_MODE", "false").lower() == "true",
     "arb_count":       0,
     "update_count":    0,
     "started_at":      None,
@@ -110,6 +112,13 @@ def _on_prices(markets: dict, snapshots: dict):
     _push("prices", {"markets": markets, "snapshots": snapshots,
                      "arb_stats": BOT_STATE["arb_stats"]})
 
+    if BOT_STATE["maker_mode"] and _bot:
+        for asset in BOT_STATE["enabled_assets"]:
+            snap = _bot.get_snapshot(asset)
+            mkt  = markets.get(asset)
+            if snap and mkt:
+                _quote_managers[asset].update(snap, mkt)
+
 def _on_arb(snap):
     if snap.asset not in BOT_STATE["enabled_assets"]:
         return
@@ -120,7 +129,9 @@ def _on_arb(snap):
         f"ARB {snap.asset}  YES={snap.yes_ask}c  NO={snap.no_ask}c  "
         f"taker_gap=+{float(snap.taker_gap):.3f}c"
     ))
-    # Execute (dry-run or live) via trader
+    # Execute only in arb mode (signal is always logged above)
+    if BOT_STATE["maker_mode"]:
+        return
     if _bot:
         mkt = _bot.markets.get(snap.asset)
         if mkt:
@@ -190,6 +201,40 @@ def _on_status(status: str):
     BOT_STATE["status"] = status
     _push("status", {"status": status})
 
+def _fill_poll_loop():
+    """Poll open maker orders for fills every 5 seconds."""
+    while True:
+        time.sleep(5)
+        if not _bot or not _bot.is_running():
+            continue
+        if not BOT_STATE["maker_mode"]:
+            continue
+        try:
+            with trader.POSITIONS._lock:
+                open_orders = dict(trader.POSITIONS._data["open_orders"])
+            for cid, info in open_orders.items():
+                oid = info.get("order_id")
+                if not oid:
+                    continue
+                try:
+                    resp   = engine.kalshi_get(f"/portfolio/orders/{oid}")
+                    order  = resp.get("order", {})
+                    filled = int(float(order.get("fill_count_fp", "0") or "0"))
+                    if filled > 0:
+                        trader.POSITIONS.record_fill(
+                            info["ticker"], info["side"],
+                            info["price_cents"], filled, cid
+                        )
+                        _add_log("✅", (
+                            f"MAKER FILL {info['asset']} {info['side'].upper()} "
+                            f"{info['price_cents']}¢ × {filled}"
+                        ))
+                        _push_positions()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 def _on_feed(asset: str, role: str, source: str):
     pass   # too noisy to push to UI
 
@@ -222,7 +267,8 @@ def _start_bot():
 
         # Pre-warm HTTP connection so the first arb order doesn't pay TCP+TLS cost.
         threading.Thread(target=engine.pre_warm_connection, daemon=True, name="http-prewarm").start()
-        threading.Thread(target=_bot.start, daemon=True, name="bot-start").start()
+        threading.Thread(target=_bot.start,        daemon=True, name="bot-start").start()
+        threading.Thread(target=_fill_poll_loop,   daemon=True, name="fill-poll").start()
         _add_log("→", f"Bot starting  demo={BOT_STATE['demo']}  dry_run={BOT_STATE['dry_run']}")
         return True, "ok"
 
@@ -297,6 +343,21 @@ def api_config():
         BOT_STATE["demo"] = bool(data["demo"])
     _add_log("⚙", f"Config updated: dry_run={BOT_STATE['dry_run']}  demo={BOT_STATE['demo']}")
     return jsonify({"ok": True, "dry_run": BOT_STATE["dry_run"], "demo": BOT_STATE["demo"]})
+
+@app.route("/api/maker_mode", methods=["POST"])
+def api_maker_mode():
+    data = request.get_json() or {}
+    enabled = bool(data.get("maker_mode", False))
+    BOT_STATE["maker_mode"] = enabled
+    # Cancel all resting maker quotes when switching back to arb
+    if not enabled and _bot:
+        for asset in engine.ASSETS:
+            mkt = _bot.markets.get(asset)
+            if mkt:
+                _quote_managers[asset].cancel_all(mkt["ticker"])
+    _add_log("⚙", f"Strategy → {'MAKER' if enabled else 'ARB'}")
+    _push("config", {"maker_mode": enabled})
+    return jsonify({"ok": True, "maker_mode": enabled})
 
 @app.route("/api/assets", methods=["POST"])
 def api_assets():
@@ -536,6 +597,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
     <div class="data-dot" id="data-dot"></div>
     <span id="data-label">No data</span>
   </div>
+  <div class="mode-toggle" style="margin-right:6px">
+    <button class="mode-btn" id="strat-arb"   onclick="setMakerMode(false)">Arb</button>
+    <button class="mode-btn" id="strat-maker" onclick="setMakerMode(true)">Maker</button>
+  </div>
   <div class="mode-toggle">
     <button class="mode-btn" id="mode-monitor" onclick="setMode(true)">Monitor</button>
     <button class="mode-btn" id="mode-trade"   onclick="setMode(false)">Trade</button>
@@ -635,7 +700,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 const S = {
-  botRunning:false, dryRun:true, demo:false,
+  botRunning:false, dryRun:true, demo:false, makerMode:false,
   enabledAssets:['BTC','ETH','SOL'],
   snapshots:{}, arbStats:{}, arbSignals:[],
   sessionPnl:0, sessionTrades:0, sessionWins:0,
@@ -665,13 +730,14 @@ function handleMsg(msg) {
   const t = msg.type;
   if (t === 'init') {
     S.dryRun = msg.dry_run; S.demo = msg.demo;
+    S.makerMode = !!msg.maker_mode;
     S.enabledAssets = msg.enabled_assets || ['BTC','ETH','SOL'];
     S.sessionPnl = msg.session_pnl || 0;
     S.sessionTrades = msg.session_trades || 0;
     S.sessionWins = msg.session_wins || 0;
     S.startedAt = msg.started_at || null;
     S.arbCount = msg.arb_count || 0;
-    updateMode(); updateStatus(msg.status);
+    updateMode(); updateMakerMode(); updateStatus(msg.status);
     S.snapshots = msg.snapshots || {};
     if (msg.arb_stats) S.arbStats = msg.arb_stats;
     renderMarkets(); updateStats();
@@ -711,6 +777,7 @@ function handleMsg(msg) {
     refreshTrades();
   } else if (t === 'config') {
     if (msg.enabled_assets) { S.enabledAssets = msg.enabled_assets; renderMarkets(); }
+    if (msg.maker_mode !== undefined) { S.makerMode = !!msg.maker_mode; updateMakerMode(); }
   }
 }
 
@@ -739,6 +806,18 @@ async function setMode(monitorMode) {
   await fetch('/api/config', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({dry_run: monitorMode})
+  });
+}
+
+function updateMakerMode() {
+  document.getElementById('strat-arb').className   = 'mode-btn' + (!S.makerMode ? ' active-monitor' : '');
+  document.getElementById('strat-maker').className = 'mode-btn' + ( S.makerMode ? ' active-monitor' : '');
+}
+async function setMakerMode(enabled) {
+  S.makerMode = enabled; updateMakerMode();
+  await fetch('/api/maker_mode', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({maker_mode: enabled})
   });
 }
 
@@ -1071,6 +1150,7 @@ function esc(s) {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 updateMode();
+updateMakerMode();
 renderMarkets();
 connectSSE();
 setInterval(refreshTrades, 5000);

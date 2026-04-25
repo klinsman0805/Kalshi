@@ -660,11 +660,12 @@ class QuoteManager:
       - Cancel all when market expires
     """
     def __init__(self, asset: str):
-        self.asset     = asset
-        self._lock     = threading.Lock()
+        self.asset            = asset
+        self._lock            = threading.Lock()
         self._yes_quote: Optional[dict] = None   # active YES bid order
         self._no_quote:  Optional[dict] = None   # active NO  bid order
         self._last_mid:  Optional[float] = None
+        self._current_ticker: Optional[str] = None
 
     def update(self, snap, mkt: dict):
         """
@@ -676,6 +677,17 @@ class QuoteManager:
             return
 
         with self._lock:
+            # Market rolled to a new ticker — clear local quote state without
+            # trying to cancel (the old market is already expired on Kalshi's side).
+            if self._current_ticker and self._current_ticker != snap.ticker:
+                for q in [self._yes_quote, self._no_quote]:
+                    if q:
+                        POSITIONS.remove_open_order(q.get("client_order_id", ""))
+                self._yes_quote = None
+                self._no_quote  = None
+                self._last_mid  = None
+            self._current_ticker = snap.ticker
+
             mid = snap.mid
             half_spread = SPREAD_TARGET_CENTS / 2
 
