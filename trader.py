@@ -88,6 +88,7 @@ POSITIONS_FILE        = Path(os.getenv("POSITIONS_FILE", "positions.json"))
 TRADES_FILE           = Path(os.getenv("TRADES_FILE",    "trades.jsonl"))
 CANCEL_ON_EXIT        = os.getenv("CANCEL_ON_EXIT", "true").lower() != "false"
 
+QUOTE_COOLDOWN_SECS   = float(os.getenv("QUOTE_COOLDOWN_SECS",   "15.0"))  # min seconds between placement attempts per asset
 ARB_COOLDOWN_SECS     = float(os.getenv("ARB_COOLDOWN_SECS",     "10.0"))
 MAX_CONCURRENT_ORDERS = int(os.getenv("MAX_CONCURRENT_ORDERS",   "1"))
 MAX_DAILY_LOSS_USD    = float(os.getenv("MAX_DAILY_LOSS_USD",     "10.0"))
@@ -340,9 +341,15 @@ def place_maker_quote(asset: str, ticker: str, side: str, price_cents: int,
         log.info("MAKER placed  %s %s  %d¢×%d  id=%s  status=%s",
                  asset, side.upper(), price_cents, n_contracts, oid, status)
     except Exception as e:
-        result["status"] = "error"
-        result["error"]  = str(e)
-        log.error("MAKER order failed: %s", e)
+        resp_text = getattr(getattr(e, 'response', None), 'text', '') or ''
+        if 'post only cross' in resp_text:
+            result["status"] = "at_cross"
+            log.warning("MAKER %s %s  at_cross — bid crossed book, will retry on next mid move",
+                        asset, side.upper())
+        else:
+            result["status"] = "error"
+            result["error"]  = str(e)
+            log.error("MAKER order failed: %s", e)
 
     _log_trade(result)
     return result
@@ -665,10 +672,13 @@ class QuoteManager:
     def __init__(self, asset: str):
         self.asset            = asset
         self._lock            = threading.Lock()
-        self._yes_quote: Optional[dict] = None   # active YES bid order
-        self._no_quote:  Optional[dict] = None   # active NO  bid order
+        self._yes_quote: Optional[dict] = None
+        self._no_quote:  Optional[dict] = None
         self._last_mid:  Optional[float] = None
         self._current_ticker: Optional[str] = None
+        self._last_place_ts: float = 0.0   # time of last placement attempt
+        self._yes_at_cross:  bool  = False  # YES bid crossed book — wait for mid move
+        self._no_at_cross:   bool  = False  # NO  bid crossed book — wait for mid move
 
     def update(self, snap, mkt: dict):
         """
@@ -680,77 +690,78 @@ class QuoteManager:
             return
 
         with self._lock:
-            # Market rolled to a new ticker — clear local quote state without
-            # trying to cancel (the old market is already expired on Kalshi's side).
+            # Market rolled — clear state without cancelling (old market already expired)
             if self._current_ticker and self._current_ticker != snap.ticker:
                 for q in [self._yes_quote, self._no_quote]:
                     if q:
                         POSITIONS.remove_open_order(q.get("client_order_id", ""))
-                self._yes_quote = None
-                self._no_quote  = None
-                self._last_mid  = None
+                self._yes_quote    = None
+                self._no_quote     = None
+                self._last_mid     = None
+                self._yes_at_cross = False
+                self._no_at_cross  = False
             self._current_ticker = snap.ticker
 
             mid = snap.mid
-            half_spread = SPREAD_TARGET_CENTS / 2
+            half_spread    = SPREAD_TARGET_CENTS / 2
+            yes_bid_target = max(1, min(99, round(mid - half_spread)))
+            no_bid_target  = max(1, min(99, round((100 - mid) - half_spread)))
 
-            # Our desired quotes
-            yes_bid_target = max(1, round(mid - half_spread))
-            no_bid_target  = max(1, round((100 - mid) - half_spread))
+            now       = time.time()
+            mid_moved = (self._last_mid is not None
+                         and abs(mid - self._last_mid) >= REQUOTE_THRESHOLD)
 
-            # Clamp to valid range
-            yes_bid_target = min(yes_bid_target, 99)
-            no_bid_target  = min(no_bid_target,  99)
+            # When mid moves enough, prices have shifted — clear at_cross so we retry
+            if mid_moved:
+                self._yes_at_cross = False
+                self._no_at_cross  = False
 
             need_requote = (
                 self._last_mid is None
-                or abs(mid - self._last_mid) >= REQUOTE_THRESHOLD
-                or self._yes_quote is None
-                or self._no_quote  is None
+                or mid_moved
+                or (self._yes_quote is None and not self._yes_at_cross)
+                or (self._no_quote  is None and not self._no_at_cross)
             )
 
-            if not need_requote:
+            # Placement cooldown — prevents rapid retry loops on failures
+            on_cooldown = (now - self._last_place_ts) < QUOTE_COOLDOWN_SECS
+
+            if not need_requote or on_cooldown:
                 return
 
-            # Check position limits before placing
-            ticker = snap.ticker
+            ticker  = snap.ticker
             yes_pos = POSITIONS.yes_position(ticker)
             no_pos  = POSITIONS.no_position(ticker)
 
             # Cancel existing quotes before replacing
             if self._yes_quote and self._yes_quote.get("order_id"):
-                cancel_quote(
-                    self._yes_quote["client_order_id"],
-                    self._yes_quote["order_id"]
-                )
+                cancel_quote(self._yes_quote["client_order_id"], self._yes_quote["order_id"])
                 self._yes_quote = None
 
             if self._no_quote and self._no_quote.get("order_id"):
-                cancel_quote(
-                    self._no_quote["client_order_id"],
-                    self._no_quote["order_id"]
-                )
+                cancel_quote(self._no_quote["client_order_id"], self._no_quote["order_id"])
                 self._no_quote = None
 
-            self._last_mid = mid
+            self._last_mid     = mid
+            self._last_place_ts = now
 
-            # Only place YES quote if under position limit
             if yes_pos < MAX_POSITION_CONTRACTS:
-                r = place_maker_quote(
-                    self.asset, ticker, "yes",
-                    yes_bid_target, TRADE_SIZE_CONTRACTS
-                )
-                if r.get("status") not in ("error",):
-                    self._yes_quote = r
+                r = place_maker_quote(self.asset, ticker, "yes",
+                                      yes_bid_target, TRADE_SIZE_CONTRACTS)
+                if r.get("status") == "at_cross":
+                    self._yes_at_cross = True
+                elif r.get("status") not in ("error",):
+                    self._yes_quote    = r
+                    self._yes_at_cross = False
 
-            # Only place NO quote if under position limit
             if no_pos < MAX_POSITION_CONTRACTS:
-                r = place_maker_quote(
-                    self.asset, ticker, "no",
-                    no_bid_target, TRADE_SIZE_CONTRACTS
-                )
-                if r.get("status") not in ("error",):
-                    self._no_quote = r
+                r = place_maker_quote(self.asset, ticker, "no",
+                                      no_bid_target, TRADE_SIZE_CONTRACTS)
+                if r.get("status") == "at_cross":
+                    self._no_at_cross = True
+                elif r.get("status") not in ("error",):
+                    self._no_quote    = r
+                    self._no_at_cross = False
 
     def cancel_all(self, ticker: str):
         """Cancel all quotes (call on market expiry)."""
