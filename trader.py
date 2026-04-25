@@ -3,7 +3,7 @@ trader.py — Kalshi Market Making Order Execution
 
 ORDER TYPES USED
 ─────────────────
-  Maker (resting limit, post_only=True):
+  Maker (resting limit, type="limit", time_in_force="gtc"):
     - Sits in the book, gets filled when someone crosses
     - Maker fee: 0.0175 × P × (1-P) per contract (4× cheaper than taker)
     - No charge until filled; no charge if cancelled
@@ -23,8 +23,8 @@ ORDER BODY (POST /portfolio/orders)
     "count":           5,              # integer contracts
     "yes_price":       48,             # cents, integer 1-99 (for YES side)
     "no_price":        52,             # cents, integer 1-99 (for NO side)
-    "time_in_force":   "gtc",                    # for maker
-    "post_only":       true,           # reject if would take (ensures maker)
+    "type":            "limit",
+    "time_in_force":   "gtc",
     "client_order_id": "mm-btc-yes-1234567890", # for tracking
   }
 
@@ -279,7 +279,7 @@ def _make_client_id(asset: str, side: str) -> str:
 def place_maker_quote(asset: str, ticker: str, side: str, price_cents: int,
                       n_contracts: int) -> dict:
     """
-    Place a resting limit order (maker, post_only=True).
+    Place a resting limit order (maker, type="limit", time_in_force="gtc").
     side: "yes" or "no"
     price_cents: integer 1-99
     Returns result dict.
@@ -309,11 +309,11 @@ def place_maker_quote(asset: str, ticker: str, side: str, price_cents: int,
 
     body = {
         "ticker":          ticker,
+        "type":            "limit",
         "side":            side,
         "action":          "buy",
         "count":           n_contracts,
         "time_in_force":   "gtc",
-        "post_only":       True,
         "client_order_id": cid,
     }
     # Set price field: yes_price for YES side, no_price for NO side
