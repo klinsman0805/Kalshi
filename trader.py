@@ -23,8 +23,8 @@ ORDER BODY (POST /portfolio/orders)
     "count":           5,              # integer contracts
     "yes_price":       48,             # cents, integer 1-99 (for YES side)
     "no_price":        52,             # cents, integer 1-99 (for NO side)
-    "type":            "limit",
-    "time_in_force":   "gtc",
+    "time_in_force":   "good_till_canceled",
+    "post_only":       true,           # prevents crossing as taker
     "client_order_id": "mm-btc-yes-1234567890", # for tracking
   }
 
@@ -260,6 +260,9 @@ def _post_order(body: dict) -> dict:
     r  = SESSION.post(url, json=body, headers=headers, timeout=ORDER_TIMEOUT)
     ms = (time.perf_counter() - t0) * 1000
     log.info("ORDER rtt=%.0fms  side=%s  status=%d", ms, body.get("side","?"), r.status_code)
+    if not r.ok:
+        log.error("ORDER body sent: %s", json.dumps(body))
+        log.error("ORDER error response: %s", r.text)
     r.raise_for_status()
     return r.json()
 
@@ -309,11 +312,11 @@ def place_maker_quote(asset: str, ticker: str, side: str, price_cents: int,
 
     body = {
         "ticker":          ticker,
-        "type":            "limit",
         "side":            side,
         "action":          "buy",
         "count":           n_contracts,
-        "time_in_force":   "gtc",
+        "time_in_force":   "good_till_canceled",
+        "post_only":       True,
         "client_order_id": cid,
     }
     # Set price field: yes_price for YES side, no_price for NO side
