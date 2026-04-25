@@ -23,7 +23,7 @@ ORDER BODY (POST /portfolio/orders)
     "count":           5,              # integer contracts
     "yes_price":       48,             # cents, integer 1-99 (for YES side)
     "no_price":        52,             # cents, integer 1-99 (for NO side)
-    "time_in_force":   "good_till_cancelled",   # for maker
+    "time_in_force":   "gtc",                    # for maker
     "post_only":       true,           # reject if would take (ensures maker)
     "client_order_id": "mm-btc-yes-1234567890", # for tracking
   }
@@ -312,7 +312,7 @@ def place_maker_quote(asset: str, ticker: str, side: str, price_cents: int,
         "side":            side,
         "action":          "buy",
         "count":           n_contracts,
-        "time_in_force":   "good_till_cancelled",
+        "time_in_force":   "gtc",
         "post_only":       True,
         "client_order_id": cid,
     }
