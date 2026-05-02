@@ -29,9 +29,9 @@ try:
 except ImportError:
     pass
 
-os.environ.setdefault("DRY_RUN",     "true")   # safe fallback if .env omits it
-os.environ.setdefault("KALSHI_DEMO", "false")  # default to live API if .env omits it
-os.environ.setdefault("MAKER_MODE", "false")   # false = arb | true = maker
+os.environ.setdefault("DRY_RUN",       "true")    # safe fallback if .env omits it
+os.environ.setdefault("KALSHI_DEMO",   "false")   # default to live API if .env omits it
+os.environ.setdefault("MOMENTUM_MODE", "false")   # false = arb | true = momentum
 
 # Stub websocket if not installed so app still loads
 try:
@@ -51,28 +51,29 @@ app.config["SECRET_KEY"] = os.urandom(24)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _bot: engine.BotEngine = None
-_quote_managers = {a: trader.QuoteManager(a, on_log=lambda ic, msg: _add_log(ic, msg)) for a in engine.ASSETS}
+_momentum_traders: dict = {}   # populated after _on_momentum_update is defined below
 _sse_clients: list = []
 _sse_lock = threading.Lock()
 _event_queue: queue.Queue = queue.Queue(maxsize=500)
 _bot_lock = threading.Lock()
 
 BOT_STATE = {
-    "status":          "stopped",
-    "dry_run":         os.getenv("DRY_RUN", "true").lower() != "false",
-    "demo":            os.getenv("KALSHI_DEMO", "true").lower() != "false",
-    "maker_mode":      os.getenv("MAKER_MODE", "false").lower() == "true",
-    "arb_count":       0,
-    "update_count":    0,
-    "started_at":      None,
-    "markets":         {},
-    "snapshots":       {},
-    "arb_stats":       {a: {} for a in engine.ASSETS},
-    "log":             [],
-    "enabled_assets":  list(engine.ASSETS),
-    "session_pnl":     0.0,
-    "session_trades":  0,
-    "session_wins":    0,
+    "status":              "stopped",
+    "dry_run":             os.getenv("DRY_RUN",       "true").lower()  != "false",
+    "demo":                os.getenv("KALSHI_DEMO",   "true").lower()  != "false",
+    "momentum_mode":       os.getenv("MOMENTUM_MODE", "false").lower() == "true",
+    "arb_count":           0,
+    "update_count":        0,
+    "started_at":          None,
+    "markets":             {},
+    "snapshots":           {},
+    "arb_stats":           {a: {} for a in engine.ASSETS},
+    "log":                 [],
+    "enabled_assets":      list(engine.ASSETS),
+    "session_pnl":         0.0,
+    "session_trades":      0,
+    "session_wins":        0,
+    "momentum_positions":  {a: None for a in engine.ASSETS},
 }
 
 def _push(event_type: str, data: dict):
@@ -103,6 +104,19 @@ def _add_log(icon: str, msg: str):
 def _on_log(icon: str, msg: str):
     _add_log(icon, msg)
 
+def _on_momentum_update(asset: str, position):
+    """Called by MomentumTrader whenever its position changes phase."""
+    BOT_STATE["momentum_positions"][asset] = position
+    _push("momentum_update", {"asset": asset, "position": position})
+
+# Populate momentum traders now that _on_momentum_update is defined.
+for _a in engine.ASSETS:
+    _momentum_traders[_a] = trader.MomentumTrader(
+        _a,
+        on_log=lambda ic, msg: _add_log(ic, msg),
+        on_update=_on_momentum_update,
+    )
+
 def _on_prices(markets: dict, snapshots: dict):
     BOT_STATE["markets"]   = markets
     BOT_STATE["snapshots"] = snapshots
@@ -112,12 +126,12 @@ def _on_prices(markets: dict, snapshots: dict):
     _push("prices", {"markets": markets, "snapshots": snapshots,
                      "arb_stats": BOT_STATE["arb_stats"]})
 
-    if BOT_STATE["maker_mode"] and _bot:
+    if BOT_STATE["momentum_mode"] and _bot:
         for asset in BOT_STATE["enabled_assets"]:
             snap = _bot.get_snapshot(asset)
             mkt  = markets.get(asset)
             if snap and mkt:
-                _quote_managers[asset].update(snap, mkt)
+                _momentum_traders[asset].update(snap, mkt)
 
 def _on_arb(snap):
     if snap.asset not in BOT_STATE["enabled_assets"]:
@@ -130,7 +144,7 @@ def _on_arb(snap):
         f"taker_gap=+{float(snap.taker_gap):.3f}c"
     ))
     # Execute only in arb mode (signal is always logged above)
-    if BOT_STATE["maker_mode"]:
+    if BOT_STATE["momentum_mode"]:
         return
     if _bot:
         mkt = _bot.markets.get(snap.asset)
@@ -201,40 +215,6 @@ def _on_status(status: str):
     BOT_STATE["status"] = status
     _push("status", {"status": status})
 
-def _fill_poll_loop():
-    """Poll open maker orders for fills every 5 seconds."""
-    while True:
-        time.sleep(5)
-        if not _bot or not _bot.is_running():
-            continue
-        if not BOT_STATE["maker_mode"]:
-            continue
-        try:
-            with trader.POSITIONS._lock:
-                open_orders = dict(trader.POSITIONS._data["open_orders"])
-            for cid, info in open_orders.items():
-                oid = info.get("order_id")
-                if not oid:
-                    continue
-                try:
-                    resp   = engine.kalshi_get(f"/portfolio/orders/{oid}")
-                    order  = resp.get("order", {})
-                    filled = int(float(order.get("fill_count_fp", "0") or "0"))
-                    if filled > 0:
-                        trader.POSITIONS.record_fill(
-                            info["ticker"], info["side"],
-                            info["price_cents"], filled, cid
-                        )
-                        _add_log("✅", (
-                            f"MAKER FILL {info['asset']} {info['side'].upper()} "
-                            f"{info['price_cents']}¢ × {filled}"
-                        ))
-                        _push_positions()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
 def _on_feed(asset: str, role: str, source: str):
     pass   # too noisy to push to UI
 
@@ -268,7 +248,6 @@ def _start_bot():
         # Pre-warm HTTP connection so the first arb order doesn't pay TCP+TLS cost.
         threading.Thread(target=engine.pre_warm_connection, daemon=True, name="http-prewarm").start()
         threading.Thread(target=_bot.start,        daemon=True, name="bot-start").start()
-        threading.Thread(target=_fill_poll_loop,   daemon=True, name="fill-poll").start()
         _add_log("→", f"Bot starting  demo={BOT_STATE['demo']}  dry_run={BOT_STATE['dry_run']}")
         return True, "ok"
 
@@ -344,20 +323,37 @@ def api_config():
     _add_log("⚙", f"Config updated: dry_run={BOT_STATE['dry_run']}  demo={BOT_STATE['demo']}")
     return jsonify({"ok": True, "dry_run": BOT_STATE["dry_run"], "demo": BOT_STATE["demo"]})
 
-@app.route("/api/maker_mode", methods=["POST"])
-def api_maker_mode():
-    data = request.get_json() or {}
-    enabled = bool(data.get("maker_mode", False))
-    BOT_STATE["maker_mode"] = enabled
-    # Cancel all resting maker quotes when switching back to arb
-    if not enabled and _bot:
+@app.route("/api/strategy", methods=["POST"])
+def api_strategy():
+    data     = request.get_json() or {}
+    strategy = data.get("strategy", "arb")
+    if strategy not in ("arb", "momentum"):
+        return jsonify({"ok": False, "error": "strategy must be arb or momentum"}), 400
+    _apply_strategy(strategy)
+    return jsonify({
+        "ok":            True,
+        "strategy":      strategy,
+        "momentum_mode": BOT_STATE["momentum_mode"],
+    })
+
+def _apply_strategy(strategy: str):
+    """Switch between arb / momentum modes, cleaning up the previous mode."""
+    prev_momentum = BOT_STATE["momentum_mode"]
+
+    BOT_STATE["momentum_mode"] = (strategy == "momentum")
+
+    # Reset momentum position state when leaving MOMENTUM mode
+    if prev_momentum and not BOT_STATE["momentum_mode"]:
         for asset in engine.ASSETS:
-            mkt = _bot.markets.get(asset)
-            if mkt:
-                _quote_managers[asset].cancel_all(mkt["ticker"])
-    _add_log("⚙", f"Strategy → {'MAKER' if enabled else 'ARB'}")
-    _push("config", {"maker_mode": enabled})
-    return jsonify({"ok": True, "maker_mode": enabled})
+            BOT_STATE["momentum_positions"][asset] = None
+
+    _add_log("⚙", f"Strategy → {strategy.upper()}")
+    _push("config", {"momentum_mode": BOT_STATE["momentum_mode"]})
+
+@app.route("/api/momentum_positions")
+def api_momentum_positions():
+    positions = {a: _momentum_traders[a].get_position() for a in engine.ASSETS}
+    return jsonify({"momentum_positions": positions})
 
 @app.route("/api/assets", methods=["POST"])
 def api_assets():
@@ -584,6 +580,23 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
 .scan-info{font-size:9px;color:var(--muted)}
 .scan-info b{color:var(--text)}
 .scan-info .hot{color:var(--arb)}
+
+/* ── Momentum strategy button ── */
+.mode-btn.active-momentum{background:rgba(245,166,35,.15);color:var(--warn)}
+
+/* ── Momentum positions row ── */
+#momentum-row{display:none;border-bottom:1px solid var(--border);background:var(--surf);
+  padding:7px 14px 7px;flex-shrink:0}
+.mom-row-inner{display:flex;align-items:center;gap:14px}
+.mom-label{font-size:8px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--muted);flex-shrink:0;min-width:80px}
+.mom-cards{display:flex;gap:8px;flex:1;flex-wrap:wrap}
+.mom-card{display:flex;align-items:center;gap:5px;padding:3px 8px;border-radius:3px;
+  font-size:9px;border:1px solid var(--border2);background:var(--surf2)}
+.mom-card.holding{border-color:rgba(245,166,35,.4);background:rgba(245,166,35,.06)}
+.mom-card.hedged{border-color:rgba(77,166,255,.4);background:rgba(77,166,255,.06)}
+.mom-card.closed{border-color:rgba(34,197,94,.4);background:rgba(34,197,94,.06)}
+.mom-cfg{font-size:9px;color:var(--muted);flex-shrink:0;margin-left:auto;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -591,7 +604,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
 
 <!-- TOPBAR -->
 <div class="topbar">
-  <div class="logo">KALSHI<em>/</em>ARB</div>
+  <div class="logo">KALSHI<em>/</em>BOT</div>
   <div class="sdot" id="sdot"></div>
   <span id="slabel">STOPPED</span>
   <div class="spacer"></div>
@@ -600,8 +613,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
     <span id="data-label">No data</span>
   </div>
   <div class="mode-toggle" style="margin-right:6px">
-    <button class="mode-btn" id="strat-arb"   onclick="setMakerMode(false)">Arb</button>
-    <button class="mode-btn" id="strat-maker" onclick="setMakerMode(true)">Maker</button>
+    <button class="mode-btn" id="strat-arb"      onclick="setStrategy('arb')">Arb</button>
+    <button class="mode-btn" id="strat-momentum" onclick="setStrategy('momentum')">Momentum</button>
   </div>
   <div class="mode-toggle">
     <button class="mode-btn" id="mode-monitor" onclick="setMode(true)">Monitor</button>
@@ -638,6 +651,21 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
 <!-- MARKETS ROW -->
 <div class="markets-row" id="markets-row">
   <!-- populated by JS -->
+</div>
+
+<!-- MOMENTUM POSITIONS ROW (visible only in momentum mode) -->
+<div id="momentum-row">
+  <div class="mom-row-inner">
+    <span class="mom-label">Momentum</span>
+    <div class="mom-cards" id="mom-cards"><!-- populated by JS --></div>
+    <div class="mom-cfg">
+      Entry&nbsp;<b id="mom-threshold" style="color:var(--text)">85¢</b>
+      &nbsp;·&nbsp;
+      TP&nbsp;<b id="mom-tp" style="color:var(--ok)">95¢</b>
+      &nbsp;·&nbsp;
+      Window&nbsp;<b style="color:var(--text)">13:00–14:00</b>
+    </div>
+  </div>
 </div>
 
 <!-- MAIN AREA -->
@@ -702,9 +730,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 const S = {
-  botRunning:false, dryRun:true, demo:false, makerMode:false,
+  botRunning:false, dryRun:true, demo:false, momentumMode:false,
   enabledAssets:['BTC','ETH','SOL'],
   snapshots:{}, arbStats:{}, arbSignals:[],
+  momentumPositions:{BTC:null,ETH:null,SOL:null},
   sessionPnl:0, sessionTrades:0, sessionWins:0,
   startedAt:null, lastPriceTs:0, assetTimers:{},
   logExpanded:false, logHeight:220, arbCount:0,
@@ -732,17 +761,18 @@ function handleMsg(msg) {
   const t = msg.type;
   if (t === 'init') {
     S.dryRun = msg.dry_run; S.demo = msg.demo;
-    S.makerMode = !!msg.maker_mode;
+    S.momentumMode = !!msg.momentum_mode;
     S.enabledAssets = msg.enabled_assets || ['BTC','ETH','SOL'];
     S.sessionPnl = msg.session_pnl || 0;
     S.sessionTrades = msg.session_trades || 0;
     S.sessionWins = msg.session_wins || 0;
     S.startedAt = msg.started_at || null;
     S.arbCount = msg.arb_count || 0;
-    updateMode(); updateMakerMode(); updateStatus(msg.status);
+    if (msg.momentum_positions) S.momentumPositions = msg.momentum_positions;
+    updateMode(); updateStrategy(); updateStatus(msg.status);
     S.snapshots = msg.snapshots || {};
     if (msg.arb_stats) S.arbStats = msg.arb_stats;
-    renderMarkets(); updateStats();
+    renderMarkets(); updateStats(); renderMomentumRow();
     document.getElementById('s-arbs').textContent = S.arbCount;
     (msg.log || []).forEach(addLog);
   } else if (t === 'prices') {
@@ -755,6 +785,10 @@ function handleMsg(msg) {
         S.assetTimers[a] = { secsLeft: s.secs_left, capturedAt: performance.now() };
     });
     renderMarkets(); checkArbSignals(); updateScanBar();
+    if (S.momentumMode) renderMomentumRow();
+  } else if (t === 'momentum_update') {
+    S.momentumPositions[msg.asset] = msg.position;
+    renderMomentumRow();
   } else if (t === 'log') {
     addLog(msg);
   } else if (t === 'status') {
@@ -779,7 +813,10 @@ function handleMsg(msg) {
     refreshTrades();
   } else if (t === 'config') {
     if (msg.enabled_assets) { S.enabledAssets = msg.enabled_assets; renderMarkets(); }
-    if (msg.maker_mode !== undefined) { S.makerMode = !!msg.maker_mode; updateMakerMode(); }
+    if (msg.momentum_mode !== undefined) {
+      S.momentumMode = !!msg.momentum_mode;
+      updateStrategy(); renderMomentumRow();
+    }
   }
 }
 
@@ -811,16 +848,71 @@ async function setMode(monitorMode) {
   });
 }
 
-function updateMakerMode() {
-  document.getElementById('strat-arb').className   = 'mode-btn' + (!S.makerMode ? ' active-monitor' : '');
-  document.getElementById('strat-maker').className = 'mode-btn' + ( S.makerMode ? ' active-monitor' : '');
+function updateStrategy() {
+  document.getElementById('strat-arb').className =
+    'mode-btn' + (!S.momentumMode ? ' active-monitor'  : '');
+  document.getElementById('strat-momentum').className =
+    'mode-btn' + ( S.momentumMode ? ' active-momentum' : '');
 }
-async function setMakerMode(enabled) {
-  S.makerMode = enabled; updateMakerMode();
-  await fetch('/api/maker_mode', {
+async function setStrategy(strategy) {
+  S.momentumMode = strategy === 'momentum';
+  updateStrategy(); renderMomentumRow();
+  await fetch('/api/strategy', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({maker_mode: enabled})
+    body: JSON.stringify({strategy})
   });
+}
+
+// ── Momentum row ──────────────────────────────────────────────────────────────
+function renderMomentumRow() {
+  const row = document.getElementById('momentum-row');
+  if (!S.momentumMode) { row.style.display = 'none'; return; }
+  row.style.display = '';
+  document.getElementById('mom-cards').innerHTML =
+    ['BTC','ETH','SOL'].map(renderMomCard).join('');
+}
+
+function renderMomCard(asset) {
+  const pos  = S.momentumPositions[asset];
+  const snap = S.snapshots[asset];
+
+  if (!pos) {
+    const secsLeft  = snap?.secs_left ?? null;
+    const elapsed   = secsLeft != null ? 900 - secsLeft : null;
+    let statusTxt   = 'waiting…';
+    if (elapsed != null) {
+      if (elapsed < 780) {
+        const rem = 780 - elapsed;
+        statusTxt = `entry in ${Math.floor(rem/60)}m${rem%60}s`;
+      } else if (elapsed <= 840) {
+        statusTxt = 'watching 14th min…';
+      } else {
+        statusTxt = 'window passed';
+      }
+    }
+    return `<div class="mom-card"><span style="color:var(--accent)">${asset}</span>`
+         + `<span style="color:var(--muted);margin-left:4px">${statusTxt}</span></div>`;
+  }
+
+  const currentBid = pos.side === 'yes' ? snap?.yes_bid : snap?.no_bid;
+  const unreal     = (currentBid != null && pos.phase === 'holding')
+    ? (currentBid - pos.entry_price) * pos.count / 100 : null;
+  const pnlStr   = unreal != null
+    ? `<span style="color:${unreal>=0?'var(--ok)':'var(--down)'};margin-left:3px">`
+      + `${unreal>=0?'+':''}$${Math.abs(unreal).toFixed(4)}</span>` : '';
+  const nowStr   = currentBid != null
+    ? `<span style="color:var(--text);margin-left:3px">→${currentBid}¢</span>` : '';
+  const hedgeStr = pos.hedge_price != null
+    ? `<span style="color:var(--up);margin-left:3px">`
+      + `+${pos.side==='yes'?'NO':'YES'}@${pos.hedge_price}¢</span>` : '';
+
+  return `<div class="mom-card ${pos.phase}">`
+       + `<span style="color:var(--accent)">${asset}</span>`
+       + `<span style="color:var(--warn);margin-left:4px">`
+       + `${pos.side.toUpperCase()}@${pos.entry_price}¢×${pos.count}</span>`
+       + nowStr + pnlStr + hedgeStr
+       + `<span style="font-size:8px;color:var(--muted);margin-left:4px">${pos.phase}</span>`
+       + `</div>`;
 }
 
 // ── Stats bar ─────────────────────────────────────────────────────────────────

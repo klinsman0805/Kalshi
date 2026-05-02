@@ -10,10 +10,9 @@ Tests cover:
   3. Market snapshot + arb detection
   4. Auth header generation (structure only)
   5. Price parsing helpers
-  6. QuoteManager logic
-  7. PositionBook tracking
-  8. DRY_RUN order execution path
-  9. BotEngine callbacks (no real WS)
+  6. PositionBook tracking
+  7. DRY_RUN order execution path
+  8. BotEngine callbacks (no real WS)
 """
 
 import json
@@ -341,50 +340,7 @@ class TestPriceParsing(unittest.TestCase):
 
 
 # ==============================================================================
-# 6. QuoteManager Tests
-# ==============================================================================
-class TestQuoteManager(unittest.TestCase):
-
-    def _make_snap_with_mid(self, yes_bid, no_bid) -> engine.MarketSnapshot:
-        book = engine.LocalBook("KXBTCD-15MIN-12345")
-        book.yes_bids = {yes_bid: 100}
-        book.no_bids  = {no_bid: 100}
-        book.ready    = True
-        return engine.MarketSnapshot(
-            asset="BTC", ticker="KXBTCD-15MIN-12345",
-            book=book, window_ts=12345, secs_left=300
-        )
-
-    def test_yes_quote_target_in_valid_range(self):
-        mid  = 50.0
-        half = trader.SPREAD_TARGET_CENTS / 2
-        yes_target = max(1, round(mid - half))
-        self.assertGreaterEqual(yes_target, 1)
-        self.assertLessEqual(yes_target, 99)
-
-    def test_no_quote_target_in_valid_range(self):
-        mid  = 48.0
-        half = trader.SPREAD_TARGET_CENTS / 2
-        no_target = max(1, round((100 - mid) - half))
-        self.assertGreaterEqual(no_target, 1)
-        self.assertLessEqual(no_target, 99)
-
-    def test_requote_sets_last_mid(self):
-        """QuoteManager records last_mid on first update."""
-        qm   = trader.QuoteManager("BTC")
-        snap = self._make_snap_with_mid(50, 50)
-        mkt  = {
-            "ticker":     "KXBTCD-15MIN-12345",
-            "close_time": "2099-01-01T00:00:00Z",
-            "window_ts":  12345,
-        }
-        self.assertIsNone(qm._last_mid)
-        qm.update(snap, mkt)
-        self.assertIsNotNone(qm._last_mid)
-
-
-# ==============================================================================
-# 7. PositionBook Tests  (fully isolated -- no shared global state)
+# 6. PositionBook Tests  (fully isolated -- no shared global state)
 # ==============================================================================
 class TestPositionBook(unittest.TestCase):
 
@@ -459,7 +415,7 @@ class TestPositionBook(unittest.TestCase):
 
 
 # ==============================================================================
-# 8. Dry-Run Order Execution Tests
+# 7. Dry-Run Order Execution Tests
 # ==============================================================================
 class TestDryRunExecution(unittest.TestCase):
 
@@ -492,33 +448,10 @@ class TestDryRunExecution(unittest.TestCase):
         self.assertIn(result["status"],
                       ("dry_run", "skipped_no_gap", "skipped_no_price"))
 
-    def test_dry_run_maker_quote_yes(self):
-        result = trader.place_maker_quote("BTC", "KXBTCD-15MIN-12345", "yes", 48, 5)
-        self.assertTrue(result["dry_run"])
-        self.assertEqual(result["status"],       "dry_run")
-        self.assertEqual(result["price_cents"],  48)
-        self.assertEqual(result["n_contracts"],  5)
-        self.assertIn("maker_fee_dollars", result)
-        self.assertIn("client_order_id",   result)
-
-    def test_dry_run_maker_quote_no(self):
-        result = trader.place_maker_quote("BTC", "KXBTCD-15MIN-12345", "no", 52, 5)
-        self.assertEqual(result["status"], "dry_run")
-        self.assertEqual(result["side"],   "no")
-
-    def test_dry_run_logs_to_trades_file(self):
-        trader.place_maker_quote("BTC", "KXBTCD-15MIN-12345", "yes", 48, 5)
-        tf = trader.TRADES_FILE
-        self.assertTrue(tf.exists(), f"Trades file not created at {tf}")
-        lines = tf.read_text().strip().splitlines()
-        self.assertGreater(len(lines), 0)
-        entry = json.loads(lines[-1])
-        self.assertIn("asset",  entry)
-        self.assertIn("status", entry)
 
 
 # ==============================================================================
-# 9. BotEngine Callback Tests (no real WS)
+# 8. BotEngine Callback Tests (no real WS)
 # ==============================================================================
 class TestBotEngineCallbacks(unittest.TestCase):
 
@@ -610,7 +543,7 @@ _ARB_MKT = {"ticker": "KXBTCD-15MIN-12345",
 
 
 # ==============================================================================
-# 10. ArbStats Tests
+# 9. ArbStats Tests
 # ==============================================================================
 class TestArbStats(unittest.TestCase):
 
@@ -696,7 +629,7 @@ class TestArbStats(unittest.TestCase):
 
 
 # ==============================================================================
-# 11. Guardrail Tests
+# 10. Guardrail Tests
 # ==============================================================================
 def _reset_guardrails():
     """Helper: wipe all guardrail state between tests."""
@@ -936,7 +869,7 @@ class TestGuardrails(unittest.TestCase):
 
 
 # ==============================================================================
-# 12. Live-Readiness Checklist
+# 11. Live-Readiness Checklist
 # ==============================================================================
 class TestLiveReadiness(unittest.TestCase):
     """

@@ -1,30 +1,16 @@
 """
-trader.py — Kalshi Market Making Order Execution
-
-ORDER TYPES USED
-─────────────────
-  Maker (resting limit, type="limit", time_in_force="gtc"):
-    - Sits in the book, gets filled when someone crosses
-    - Maker fee: 0.0175 × P × (1-P) per contract (4× cheaper than taker)
-    - No charge until filled; no charge if cancelled
-    - This is our PRIMARY order type
-
-  Taker (immediate IOC, time_in_force="immediate_or_cancel"):
-    - Fills immediately against resting orders or cancels
-    - Taker fee: 0.07 × P × (1-P) per contract
-    - Used only for arb execution when a gap > fees exists
+trader.py — Kalshi Order Execution
 
 ORDER BODY (POST /portfolio/orders)
 ─────────────────────────────────────
   {
     "ticker":          "KXBTCD-15MIN-1234567890",
     "side":            "yes" | "no",
-    "action":          "buy",
+    "action":          "buy" | "sell",
     "count":           5,              # integer contracts
     "yes_price":       48,             # cents, integer 1-99 (for YES side)
     "no_price":        52,             # cents, integer 1-99 (for NO side)
-    "time_in_force":   "good_till_canceled",
-    "post_only":       true,           # prevents crossing as taker
+    "time_in_force":   "immediate_or_cancel",
     "client_order_id": "mm-btc-yes-1234567890", # for tracking
   }
 
@@ -75,10 +61,9 @@ from engine import (
     kalshi_get, _auth_headers, API_BASE, SESSION, ORDER_TIMEOUT,
     total_maker_fee, total_taker_fee, arb_gap_cents,
     TRADE_SIZE_CONTRACTS, MAX_POSITION_CONTRACTS,
-    SPREAD_TARGET_CENTS, REQUOTE_THRESHOLD,
     MIN_PRICE_CENTS, MAX_PRICE_CENTS,
     SWEEP_CENTS, MIN_PROFIT_AFTER_SWEEP,
-    DRY_RUN, USE_DEMO, ASSETS,
+    DRY_RUN, USE_DEMO, ASSETS, WINDOW_SECS,
 )
 
 log = logging.getLogger("kalshi.trader")
@@ -88,11 +73,24 @@ POSITIONS_FILE        = Path(os.getenv("POSITIONS_FILE", "positions.json"))
 TRADES_FILE           = Path(os.getenv("TRADES_FILE",    "trades.jsonl"))
 CANCEL_ON_EXIT        = os.getenv("CANCEL_ON_EXIT", "true").lower() != "false"
 
-QUOTE_COOLDOWN_SECS   = float(os.getenv("QUOTE_COOLDOWN_SECS",   "15.0"))  # min seconds between placement attempts per asset
 ARB_COOLDOWN_SECS     = float(os.getenv("ARB_COOLDOWN_SECS",     "10.0"))
 MAX_CONCURRENT_ORDERS = int(os.getenv("MAX_CONCURRENT_ORDERS",   "1"))
 MAX_DAILY_LOSS_USD    = float(os.getenv("MAX_DAILY_LOSS_USD",     "10.0"))
 MIN_SECS_LEFT         = int(os.getenv("MIN_SECS_LEFT",           "60"))
+
+# ── Momentum config ────────────────────────────────────────────────────────────
+# Entry:  buy whichever side has bid >= MOMENTUM_ENTRY_THRESHOLD in the 14th minute.
+# TP:     IOC sell when bid >= MOMENTUM_TAKE_PROFIT in the last 60 s.
+# Hedge:  IOC buy opposite side when entry side dropped >= REVERSAL_DROP AND
+#         opposite ask <= (100 - entry_price), keeping combined cost <= 100¢.
+MOMENTUM_ENTRY_THRESHOLD = int(os.getenv("MOMENTUM_ENTRY_THRESHOLD", "85"))   # ¢ bid to trigger entry
+MOMENTUM_TAKE_PROFIT     = int(os.getenv("MOMENTUM_TAKE_PROFIT",     "95"))   # ¢ bid at which to sell
+MOMENTUM_ENTRY_START     = int(os.getenv("MOMENTUM_ENTRY_START",     "780"))  # window elapsed secs (13:00)
+MOMENTUM_ENTRY_END       = int(os.getenv("MOMENTUM_ENTRY_END",       "840"))  # window elapsed secs (14:00)
+MOMENTUM_REVERSAL_DROP   = int(os.getenv("MOMENTUM_REVERSAL_DROP",   "10"))   # ¢ drop from entry to begin watching for hedge
+MOMENTUM_HEDGE_MIN_GAP   = int(os.getenv("MOMENTUM_HEDGE_MIN_GAP",    "5"))   # ¢ minimum net profit after both legs (entry + hedge < 100 - gap)
+MOMENTUM_TP_COOLDOWN     = float(os.getenv("MOMENTUM_TP_COOLDOWN",   "3.0"))  # s between TP retries
+MOMENTUM_HEDGE_COOLDOWN  = float(os.getenv("MOMENTUM_HEDGE_COOLDOWN","3.0"))  # s between hedge retries
 
 # ── Position book ─────────────────────────────────────────────────────────────
 class PositionBook:
@@ -278,102 +276,6 @@ def _cancel_order(order_id: str) -> dict:
 
 def _make_client_id(asset: str, side: str) -> str:
     return f"mm-{asset.lower()}-{side}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-
-# ── Market making ─────────────────────────────────────────────────────────────
-def place_maker_quote(asset: str, ticker: str, side: str, price_cents: int,
-                      n_contracts: int) -> dict:
-    """
-    Place a resting limit order (maker, type="limit", time_in_force="gtc").
-    side: "yes" or "no"
-    price_cents: integer 1-99
-    Returns result dict.
-    """
-    cid = _make_client_id(asset, side)
-    fee = total_maker_fee(price_cents, n_contracts)
-
-    result = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "asset": asset, "ticker": ticker,
-        "side": side, "price_cents": price_cents,
-        "n_contracts": n_contracts,
-        "maker_fee_dollars": float(fee),
-        "client_order_id": cid,
-        "dry_run": DRY_RUN,
-        "status": "pending",
-        "order_id": None,
-        "error": None,
-    }
-
-    if DRY_RUN:
-        result["status"] = "dry_run"
-        log.info("[DRY RUN] MAKER %s  %s  %d¢ × %d  fee=$%.4f  cid=%s",
-                 asset, side.upper(), price_cents, n_contracts, fee, cid)
-        _log_trade(result)
-        return result
-
-    body = {
-        "ticker":          ticker,
-        "side":            side,
-        "action":          "buy",
-        "count":           n_contracts,
-        "time_in_force":   "good_till_canceled",
-        "post_only":       True,
-        "client_order_id": cid,
-    }
-    # Set price field: yes_price for YES side, no_price for NO side
-    if side == "yes":
-        body["yes_price"] = price_cents
-    else:
-        body["no_price"] = price_cents
-
-    try:
-        resp = _post_order(body)
-        order = resp.get("order", {})
-        oid   = order.get("order_id")
-        status = order.get("status", "unknown")
-        result.update({"status": status, "order_id": oid})
-        POSITIONS.record_open_order(cid, {
-            "asset": asset, "ticker": ticker,
-            "side": side, "price_cents": price_cents,
-            "count": n_contracts, "order_id": oid,
-            "ts": result["ts"],
-        })
-        log.info("MAKER placed  %s %s  %d¢×%d  id=%s  status=%s",
-                 asset, side.upper(), price_cents, n_contracts, oid, status)
-    except Exception as e:
-        resp_text = getattr(getattr(e, 'response', None), 'text', '') or ''
-        if 'post only cross' in resp_text:
-            result["status"] = "at_cross"
-            log.warning("MAKER %s %s  at_cross — bid crossed book, will retry on next mid move",
-                        asset, side.upper())
-        else:
-            result["status"] = "error"
-            result["error"]  = str(e)
-            log.error("MAKER order failed: %s", e)
-
-    _log_trade(result)
-    return result
-
-def cancel_quote(client_order_id: str, order_id: str) -> bool:
-    """Cancel a resting maker order. Returns True if cancelled."""
-    if DRY_RUN:
-        log.info("[DRY RUN] CANCEL  cid=%s  oid=%s", client_order_id, order_id)
-        POSITIONS.remove_open_order(client_order_id)
-        return True
-    try:
-        _cancel_order(order_id)
-        POSITIONS.remove_open_order(client_order_id)
-        log.info("CANCELLED  oid=%s", order_id)
-        return True
-    except Exception as e:
-        log.warning("Cancel failed for %s: %s", order_id, e)
-        return False
-
-def cancel_all_for_ticker(ticker: str):
-    """Cancel all open maker orders for a given ticker."""
-    orders = POSITIONS.open_orders_for(ticker)
-    for o in orders:
-        cancel_quote(o["client_order_id"], o.get("order_id", ""))
 
 # ── Arb execution helpers ─────────────────────────────────────────────────────
 def _unwind(asset: str, ticker: str, snap, side: str, count: int, entry_price: int) -> bool:
@@ -659,127 +561,6 @@ def execute_arb(snap, mkt: dict, bot=None) -> Optional[dict]:
     finally:
         _ARB_LOCK.release()
 
-# ── Quote manager ──────────────────────────────────────────────────────────────
-class QuoteManager:
-    """
-    Manages resting maker quotes for one asset.
-    Strategy:
-      - Post YES bid at  mid - spread/2
-      - Post NO  bid at  (100 - mid) - spread/2
-      - Cancel + replace when mid moves > REQUOTE_THRESHOLD cents
-      - Cancel all when market expires
-    """
-    def __init__(self, asset: str, on_log=None):
-        self.asset            = asset
-        self._lock            = threading.Lock()
-        self._yes_quote: Optional[dict] = None
-        self._no_quote:  Optional[dict] = None
-        self._last_mid:  Optional[float] = None
-        self._current_ticker: Optional[str] = None
-        self._last_place_ts: float = 0.0
-        self._yes_at_cross:  bool  = False
-        self._no_at_cross:   bool  = False
-        self._on_log = on_log or (lambda icon, msg: None)
-
-    def update(self, snap, mkt: dict):
-        """
-        Called on every price update. Decides whether to place/replace quotes.
-        snap: MarketSnapshot
-        mkt:  market dict
-        """
-        if snap.mid is None:
-            return
-
-        with self._lock:
-            # Market rolled — clear state without cancelling (old market already expired)
-            if self._current_ticker and self._current_ticker != snap.ticker:
-                for q in [self._yes_quote, self._no_quote]:
-                    if q:
-                        POSITIONS.remove_open_order(q.get("client_order_id", ""))
-                self._yes_quote    = None
-                self._no_quote     = None
-                self._last_mid     = None
-                self._yes_at_cross = False
-                self._no_at_cross  = False
-            self._current_ticker = snap.ticker
-
-            mid = snap.mid
-            half_spread    = SPREAD_TARGET_CENTS / 2
-            yes_bid_target = max(1, min(99, round(mid - half_spread)))
-            no_bid_target  = max(1, min(99, round((100 - mid) - half_spread)))
-
-            now       = time.time()
-            mid_moved = (self._last_mid is not None
-                         and abs(mid - self._last_mid) >= REQUOTE_THRESHOLD)
-
-            # When mid moves enough, prices have shifted — clear at_cross so we retry
-            if mid_moved:
-                self._yes_at_cross = False
-                self._no_at_cross  = False
-
-            need_requote = (
-                self._last_mid is None
-                or mid_moved
-                or (self._yes_quote is None and not self._yes_at_cross)
-                or (self._no_quote  is None and not self._no_at_cross)
-            )
-
-            # Placement cooldown — prevents rapid retry loops on failures
-            on_cooldown = (now - self._last_place_ts) < QUOTE_COOLDOWN_SECS
-
-            if not need_requote or on_cooldown:
-                return
-
-            ticker  = snap.ticker
-            yes_pos = POSITIONS.yes_position(ticker)
-            no_pos  = POSITIONS.no_position(ticker)
-
-            # Cancel existing quotes before replacing
-            if self._yes_quote and self._yes_quote.get("order_id"):
-                cancel_quote(self._yes_quote["client_order_id"], self._yes_quote["order_id"])
-                self._yes_quote = None
-
-            if self._no_quote and self._no_quote.get("order_id"):
-                cancel_quote(self._no_quote["client_order_id"], self._no_quote["order_id"])
-                self._no_quote = None
-
-            self._last_mid     = mid
-            self._last_place_ts = now
-
-            if yes_pos < MAX_POSITION_CONTRACTS:
-                r = place_maker_quote(self.asset, ticker, "yes",
-                                      yes_bid_target, TRADE_SIZE_CONTRACTS)
-                if r.get("status") == "at_cross":
-                    self._yes_at_cross = True
-                    self._on_log("~", f"MAKER {self.asset} YES {yes_bid_target}¢ at_cross — retrying on next mid move")
-                elif r.get("status") not in ("error",):
-                    self._yes_quote    = r
-                    self._yes_at_cross = False
-                else:
-                    self._on_log("!", f"MAKER {self.asset} YES failed: {r.get('error','')}")
-
-            if no_pos < MAX_POSITION_CONTRACTS:
-                r = place_maker_quote(self.asset, ticker, "no",
-                                      no_bid_target, TRADE_SIZE_CONTRACTS)
-                if r.get("status") == "at_cross":
-                    self._no_at_cross = True
-                    self._on_log("~", f"MAKER {self.asset} NO {no_bid_target}¢ at_cross — retrying on next mid move")
-                elif r.get("status") not in ("error",):
-                    self._no_quote    = r
-                    self._no_at_cross = False
-                else:
-                    self._on_log("!", f"MAKER {self.asset} NO failed: {r.get('error','')}")
-
-    def cancel_all(self, ticker: str):
-        """Cancel all quotes (call on market expiry)."""
-        with self._lock:
-            for q in [self._yes_quote, self._no_quote]:
-                if q and q.get("order_id"):
-                    cancel_quote(q["client_order_id"], q["order_id"])
-            self._yes_quote = None
-            self._no_quote  = None
-            self._last_mid  = None
-
 # ── Trade log ─────────────────────────────────────────────────────────────────
 def _log_trade(entry: dict):
     try:
@@ -787,3 +568,347 @@ def _log_trade(entry: dict):
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception:
         pass
+
+
+# ── Momentum strategy ──────────────────────────────────────────────────────────
+class MomentumTrader:
+    """
+    Near-expiry momentum strategy for Kalshi 15-min markets.
+
+    Phase 1 — Entry [780–840 s elapsed / 13:00–14:00 into window]:
+      IOC buy whichever side (YES or NO) has bid >= MOMENTUM_ENTRY_THRESHOLD (85¢).
+      If both qualify, take the higher-priced side.  One attempt per window only.
+
+    Phase 2 — Take profit [last 60 s, secs_left <= 60]:
+      IOC sell when current bid for held side >= MOMENTUM_TAKE_PROFIT (95¢).
+      Retries every MOMENTUM_TP_COOLDOWN seconds until filled or market expires.
+
+    Phase 3 — Reversal hedge [last 60 s, only while holding]:
+      Triggered when entry-side bid drops >= MOMENTUM_REVERSAL_DROP (10¢) from
+      entry price.  Buys the opposite side via IOC only if its ask is <=
+      (100 - entry_price), keeping combined cost <= 100¢ (arb guarantee).
+      Uses the entry price — not the current price — for the threshold so the
+      total outlay can never exceed what was paid for the initial leg.
+
+    If neither TP nor hedge fires before expiry the position is held to
+    resolution; Kalshi settles at 100¢ (win) or 0¢ (loss).
+    """
+
+    def __init__(self, asset: str, on_log=None, on_update=None):
+        self.asset      = asset
+        self._lock      = threading.Lock()
+        self._on_log    = on_log    or (lambda ic, msg: None)
+        self._on_update = on_update or (lambda asset, pos: None)
+
+        self._position: Optional[dict] = None
+        self._entry_attempted = False
+        self._tp_last_ts      = 0.0
+        self._hedge_last_ts   = 0.0
+        self._hedge_attempted = False
+        self._current_ticker: Optional[str] = None
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def update(self, snap, mkt: dict):
+        """
+        Called on every price update from the WS handler.
+        Checks all three phases sequentially; places IOC orders inline (blocks
+        briefly — acceptable since each phase fires at most once per window).
+        """
+        elapsed = WINDOW_SECS - snap.secs_left
+
+        with self._lock:
+            if self._current_ticker and self._current_ticker != snap.ticker:
+                self._reset_window()
+            self._current_ticker = snap.ticker
+
+            now = time.time()
+            pos = self._position
+
+            # Phase 1: entry window
+            if pos is None and not self._entry_attempted:
+                if MOMENTUM_ENTRY_START <= elapsed <= MOMENTUM_ENTRY_END:
+                    self._try_entry(snap)
+
+            # Phase 2: take profit (refresh pos reference after possible entry)
+            pos = self._position
+            if (pos is not None and pos["phase"] == "holding"
+                    and snap.secs_left <= 60
+                    and now - self._tp_last_ts >= MOMENTUM_TP_COOLDOWN):
+                self._try_take_profit(snap)
+
+            # Phase 3: reversal hedge
+            pos = self._position
+            if (pos is not None and pos["phase"] == "holding"
+                    and snap.secs_left <= 60
+                    and not self._hedge_attempted
+                    and now - self._hedge_last_ts >= MOMENTUM_HEDGE_COOLDOWN):
+                self._check_reversal_hedge(snap)
+
+    def get_position(self) -> Optional[dict]:
+        with self._lock:
+            return dict(self._position) if self._position else None
+
+    def on_market_expire(self, ticker: str):
+        """Call when the market window closes so held positions are logged."""
+        with self._lock:
+            if self._current_ticker == ticker and self._position:
+                p = self._position
+                if p["phase"] == "holding":
+                    self._on_log("⏰", (
+                        f"MOMENTUM {self.asset} held to resolution: "
+                        f"{p['side'].upper()} {p['entry_price']}¢ × {p['count']} — "
+                        f"Kalshi settles at 100¢ (win) or 0¢ (loss)"
+                    ))
+            self._reset_window()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _reset_window(self):
+        """Clear per-window state. Must hold _lock."""
+        self._position        = None
+        self._entry_attempted = False
+        self._tp_last_ts      = 0.0
+        self._hedge_last_ts   = 0.0
+        self._hedge_attempted = False
+
+    def _notify(self):
+        """Push position update to app layer. Must hold _lock."""
+        self._on_update(self.asset, dict(self._position) if self._position else None)
+
+    def _try_entry(self, snap):
+        """IOC buy at best qualifying bid. Must hold _lock."""
+        yes_ok = snap.yes_bid is not None and snap.yes_bid >= MOMENTUM_ENTRY_THRESHOLD
+        no_ok  = snap.no_bid  is not None and snap.no_bid  >= MOMENTUM_ENTRY_THRESHOLD
+        if not yes_ok and not no_ok:
+            return  # no qualifying side yet; will retry next tick within window
+
+        self._entry_attempted = True  # one attempt per window regardless of outcome
+
+        if yes_ok and no_ok:
+            side = "yes" if snap.yes_bid >= snap.no_bid else "no"
+        elif yes_ok:
+            side = "yes"
+        else:
+            side = "no"
+
+        price = snap.yes_bid if side == "yes" else snap.no_bid
+        n     = TRADE_SIZE_CONTRACTS
+        cid   = _make_client_id(self.asset, f"mom-{side}")
+
+        self._on_log("🎯", (
+            f"MOMENTUM ENTRY {self.asset} {side.upper()} at {price}¢  "
+            f"(elapsed={WINDOW_SECS - snap.secs_left}s  secs_left={snap.secs_left})"
+        ))
+
+        if DRY_RUN:
+            self._position = {
+                "ticker":      snap.ticker,
+                "side":        side,
+                "entry_price": price,
+                "count":       n,
+                "entry_ts":    datetime.now(timezone.utc).isoformat(),
+                "phase":       "holding",
+                "hedge_price": None,
+                "hedge_count": None,
+            }
+            self._on_log("📋", f"[DRY RUN] MOMENTUM {self.asset} {side.upper()} {price}¢ × {n}")
+            self._notify()
+            return
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            side,
+            "action":          "buy",
+            "count":           n,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid,
+        }
+        body["yes_price" if side == "yes" else "no_price"] = price
+
+        try:
+            resp   = _post_order(body)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                self._position = {
+                    "ticker":      snap.ticker,
+                    "side":        side,
+                    "entry_price": price,
+                    "count":       filled,
+                    "entry_ts":    datetime.now(timezone.utc).isoformat(),
+                    "phase":       "holding",
+                    "hedge_price": None,
+                    "hedge_count": None,
+                }
+                POSITIONS.record_fill(snap.ticker, side, price, filled, cid)
+                _log_trade({
+                    "ts": self._position["entry_ts"], "type": "momentum_entry",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "side": side, "price": price, "count": filled,
+                })
+                self._on_log("✅", (
+                    f"MOMENTUM ENTRY FILLED {self.asset} {side.upper()} {price}¢ × {filled}"
+                ))
+                self._notify()
+            else:
+                self._on_log("⏸", (
+                    f"MOMENTUM ENTRY {self.asset} {side.upper()} {price}¢ — IOC no fill "
+                    f"(book moved; no retry this window)"
+                ))
+        except Exception as e:
+            self._on_log("✗", f"MOMENTUM ENTRY error {self.asset}: {e}")
+
+    def _try_take_profit(self, snap):
+        """IOC sell at current bid when bid >= TAKE_PROFIT target. Must hold _lock."""
+        self._tp_last_ts = time.time()
+        pos  = self._position
+        side = pos["side"]
+
+        current_bid = snap.yes_bid if side == "yes" else snap.no_bid
+        if current_bid is None or current_bid < MOMENTUM_TAKE_PROFIT:
+            return  # target not reached yet; will retry after cooldown
+
+        n          = pos["count"]
+        sell_price = current_bid
+        cid        = _make_client_id(self.asset, f"mom-tp-{side}")
+        profit_est = (sell_price - pos["entry_price"]) * n / 100
+
+        self._on_log("💰", (
+            f"MOMENTUM TP {self.asset} {side.upper()}  "
+            f"sell={sell_price}¢  entry={pos['entry_price']}¢  est_pnl=+${profit_est:.4f}"
+        ))
+
+        if DRY_RUN:
+            POSITIONS.realise_pnl(profit_est)
+            self._position["phase"] = "closed"
+            self._on_log("📋", f"[DRY RUN] MOMENTUM TP {self.asset} {sell_price}¢ × {n}  pnl=+${profit_est:.4f}")
+            self._notify()
+            return
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            side,
+            "action":          "sell",
+            "count":           n,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid,
+        }
+        body["yes_price" if side == "yes" else "no_price"] = sell_price
+
+        try:
+            resp   = _post_order(body)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                pnl = (sell_price - pos["entry_price"]) * filled / 100
+                POSITIONS.realise_pnl(pnl)
+                self._position["phase"] = "closed"
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_tp",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "side": side, "sell_price": sell_price,
+                    "entry_price": pos["entry_price"], "count": filled, "pnl": pnl,
+                })
+                self._on_log("✅", (
+                    f"MOMENTUM TP SOLD {self.asset} {side.upper()} {sell_price}¢ × {filled}  "
+                    f"pnl=+${pnl:.4f}"
+                ))
+                self._notify()
+            else:
+                self._on_log("⏸", f"MOMENTUM TP {self.asset} {side.upper()} {sell_price}¢ — no fill, retrying")
+        except Exception as e:
+            self._on_log("✗", f"MOMENTUM TP error {self.asset}: {e}")
+
+    def _check_reversal_hedge(self, snap):
+        """
+        Buy the opposite side when:
+          - Entry side bid has dropped >= REVERSAL_DROP from entry price
+          - Opposite ask <= (100 - entry_price)  →  combined cost <= 100¢
+        Uses entry_price for the threshold (not current price) so the hedge
+        only fires when there is a genuine arb guarantee.
+        Must hold _lock.
+        """
+        self._hedge_last_ts = time.time()
+        pos         = self._position
+        side        = pos["side"]
+        entry_price = pos["entry_price"]
+
+        current_bid = snap.yes_bid if side == "yes" else snap.no_bid
+        if current_bid is None or entry_price - current_bid < MOMENTUM_REVERSAL_DROP:
+            return  # reversal not large enough yet
+
+        hedge_side      = "no"  if side == "yes" else "yes"
+        hedge_ask       = snap.no_ask if side == "yes" else snap.yes_ask
+        # Require at least MOMENTUM_HEDGE_MIN_GAP¢ net profit so combined cost
+        # is strictly less than (100 - gap)¢ — e.g. entry=85¢ + hedge<10¢ = <95¢
+        # guaranteeing profit even after taker fees on the hedge leg.
+        hedge_threshold = 100 - entry_price - MOMENTUM_HEDGE_MIN_GAP
+
+        if hedge_ask is None or hedge_ask >= hedge_threshold:
+            # Gap not wide enough (or no book); mark attempted to skip costly retries.
+            self._hedge_attempted = True
+            return
+
+        self._hedge_attempted = True
+        n          = pos["count"]
+        cid        = _make_client_id(self.asset, f"mom-hedge-{hedge_side}")
+        total_cost = entry_price + hedge_ask
+        locked_gap = 100 - total_cost
+
+        self._on_log("🛡", (
+            f"MOMENTUM HEDGE {self.asset} buy {hedge_side.upper()} at {hedge_ask}¢  "
+            f"(entry={entry_price}¢  max_hedge={hedge_threshold - 1}¢  "
+            f"combined={total_cost}¢  locked_gap=+{locked_gap}¢)"
+        ))
+
+        if DRY_RUN:
+            self._position["phase"]       = "hedged"
+            self._position["hedge_price"] = hedge_ask
+            self._position["hedge_count"] = n
+            self._on_log("📋", (
+                f"[DRY RUN] MOMENTUM HEDGE {self.asset} {hedge_side.upper()} {hedge_ask}¢ × {n}"
+            ))
+            self._notify()
+            return
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            hedge_side,
+            "action":          "buy",
+            "count":           n,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid,
+        }
+        body["yes_price" if hedge_side == "yes" else "no_price"] = hedge_ask
+
+        try:
+            resp   = _post_order(body)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                POSITIONS.record_fill(snap.ticker, hedge_side, hedge_ask, filled, cid)
+                self._position["phase"]       = "hedged"
+                self._position["hedge_price"] = hedge_ask
+                self._position["hedge_count"] = filled
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_hedge",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "hedge_side": hedge_side, "hedge_price": hedge_ask,
+                    "entry_side": side, "entry_price": entry_price,
+                    "count": filled, "total_cost": total_cost,
+                })
+                self._on_log("✅", (
+                    f"MOMENTUM HEDGE FILLED {self.asset} {hedge_side.upper()} "
+                    f"{hedge_ask}¢ × {filled}  combined={total_cost}¢  "
+                    f"locked_gap=+{locked_gap}¢"
+                ))
+                self._notify()
+            else:
+                self._hedge_attempted = False  # allow one retry — gap may persist
+                self._on_log("⏸", (
+                    f"MOMENTUM HEDGE {self.asset} {hedge_side.upper()} {hedge_ask}¢ — no fill"
+                ))
+        except Exception as e:
+            self._hedge_attempted = False
+            self._on_log("✗", f"MOMENTUM HEDGE error {self.asset}: {e}")

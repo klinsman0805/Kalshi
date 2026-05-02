@@ -23,15 +23,10 @@ FEE STRUCTURE (confirmed from official docs + academic papers, April 2025+)
   Both fees rounded UP to nearest cent on the TOTAL order.
   No fee to cancel a resting order.
 
-STRATEGY: Market Making
-───────────────────────
-Post resting limit orders on BOTH YES and NO sides.
-Collect the spread when others trade against us (we're the maker).
-Skew quotes toward fair value using cross-market signal (Polymarket prices).
-Cancel/replace quotes when:
-  - Our position exceeds MAX_POSITION_CONTRACTS per side
-  - Price moves > REQUOTE_THRESHOLD cents from our quotes
-  - Window expires (new 15-min market opens)
+STRATEGIES
+──────────
+ARB:      IOC buy YES + NO simultaneously when taker_gap > 0 (guaranteed profit).
+MOMENTUM: Buy the dominant side near expiry (minute 14) and take profit at 95¢.
 
 MARKET TICKERS
 ───────────────
@@ -104,8 +99,6 @@ else:
 
 TRADE_SIZE_CONTRACTS = int(os.getenv("TRADE_SIZE_CONTRACTS", "5"))   # contracts per order leg
 MAX_POSITION_CONTRACTS = int(os.getenv("MAX_POSITION_CONTRACTS", "20"))  # max open per side
-SPREAD_TARGET_CENTS  = int(os.getenv("SPREAD_TARGET_CENTS", "3"))    # target bid/ask spread in cents
-REQUOTE_THRESHOLD    = int(os.getenv("REQUOTE_THRESHOLD", "2"))       # reprice if fair value moves > N cents
 MIN_GAP_CENTS   = float(os.getenv("MIN_GAP_CENTS", "0.0"))            # min taker gap (¢) to fire on_arb; 0 = fire on any profitable gap
 MIN_PRICE_CENTS = int(os.getenv("MIN_PRICE_CENTS", "10"))             # ask below this → order book too thin to fill
 MAX_PRICE_CENTS = int(os.getenv("MAX_PRICE_CENTS", "90"))             # ask above this → order book too thin to fill
