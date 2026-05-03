@@ -136,6 +136,8 @@ def _on_prices(markets: dict, snapshots: dict):
 def _on_arb(snap):
     if snap.asset not in BOT_STATE["enabled_assets"]:
         return
+    if BOT_STATE["momentum_mode"]:
+        return
     BOT_STATE["arb_count"] += 1
     data = snap.to_dict()
     _push("arb", data)
@@ -143,9 +145,6 @@ def _on_arb(snap):
         f"ARB {snap.asset}  YES={snap.yes_ask}c  NO={snap.no_ask}c  "
         f"taker_gap=+{float(snap.taker_gap):.3f}c"
     ))
-    # Execute only in arb mode (signal is always logged above)
-    if BOT_STATE["momentum_mode"]:
-        return
     if _bot:
         mkt = _bot.markets.get(snap.asset)
         if mkt:

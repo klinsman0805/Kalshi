@@ -89,8 +89,10 @@ MOMENTUM_ENTRY_START     = int(os.getenv("MOMENTUM_ENTRY_START",     "780"))  # 
 MOMENTUM_ENTRY_END       = int(os.getenv("MOMENTUM_ENTRY_END",       "840"))  # window elapsed secs (14:00)
 MOMENTUM_REVERSAL_DROP   = int(os.getenv("MOMENTUM_REVERSAL_DROP",   "10"))   # ¢ drop from entry to begin watching for hedge
 MOMENTUM_HEDGE_MIN_GAP   = int(os.getenv("MOMENTUM_HEDGE_MIN_GAP",    "5"))   # ¢ minimum net profit after both legs (entry + hedge < 100 - gap)
-MOMENTUM_TP_COOLDOWN     = float(os.getenv("MOMENTUM_TP_COOLDOWN",   "3.0"))  # s between TP retries
-MOMENTUM_HEDGE_COOLDOWN  = float(os.getenv("MOMENTUM_HEDGE_COOLDOWN","3.0"))  # s between hedge retries
+MOMENTUM_TP_COOLDOWN          = float(os.getenv("MOMENTUM_TP_COOLDOWN",          "3.0"))  # s between TP retries
+MOMENTUM_HEDGE_COOLDOWN       = float(os.getenv("MOMENTUM_HEDGE_COOLDOWN",       "3.0"))  # s between hedge retries
+MOMENTUM_ENTRY_RETRY_MAX      = int(os.getenv("MOMENTUM_ENTRY_RETRY_MAX",        "90"))   # ¢ upper bound for no-fill retry range
+MOMENTUM_ENTRY_RETRY_COOLDOWN = float(os.getenv("MOMENTUM_ENTRY_RETRY_COOLDOWN", "2.0"))  # s between entry retry attempts
 
 # ── Position book ─────────────────────────────────────────────────────────────
 class PositionBook:
@@ -602,6 +604,7 @@ class MomentumTrader:
 
         self._position: Optional[dict] = None
         self._entry_attempted = False
+        self._entry_last_ts   = 0.0
         self._tp_last_ts      = 0.0
         self._hedge_last_ts   = 0.0
         self._hedge_attempted = False
@@ -628,7 +631,8 @@ class MomentumTrader:
             # Phase 1: entry window
             if pos is None and not self._entry_attempted:
                 if MOMENTUM_ENTRY_START <= elapsed <= MOMENTUM_ENTRY_END:
-                    self._try_entry(snap)
+                    if now - self._entry_last_ts >= MOMENTUM_ENTRY_RETRY_COOLDOWN:
+                        self._try_entry(snap)
 
             # Phase 2: take profit (refresh pos reference after possible entry)
             pos = self._position
@@ -668,6 +672,7 @@ class MomentumTrader:
         """Clear per-window state. Must hold _lock."""
         self._position        = None
         self._entry_attempted = False
+        self._entry_last_ts   = 0.0
         self._tp_last_ts      = 0.0
         self._hedge_last_ts   = 0.0
         self._hedge_attempted = False
@@ -682,8 +687,6 @@ class MomentumTrader:
         no_ok  = snap.no_bid  is not None and snap.no_bid  >= MOMENTUM_ENTRY_THRESHOLD
         if not yes_ok and not no_ok:
             return  # no qualifying side yet; will retry next tick within window
-
-        self._entry_attempted = True  # one attempt per window regardless of outcome
 
         if yes_ok and no_ok:
             side = "yes" if snap.yes_bid >= snap.no_bid else "no"
@@ -702,6 +705,7 @@ class MomentumTrader:
         ))
 
         if DRY_RUN:
+            self._entry_attempted = True
             self._position = {
                 "ticker":      snap.ticker,
                 "side":        side,
@@ -726,11 +730,13 @@ class MomentumTrader:
         }
         body["yes_price" if side == "yes" else "no_price"] = price
 
+        self._entry_last_ts = time.time()
         try:
             resp   = _post_order(body)
             order  = resp.get("order", {})
             filled = int(float(order.get("fill_count_fp", "0") or "0"))
             if filled > 0:
+                self._entry_attempted = True
                 self._position = {
                     "ticker":      snap.ticker,
                     "side":        side,
@@ -752,9 +758,12 @@ class MomentumTrader:
                 ))
                 self._notify()
             else:
+                retryable = MOMENTUM_ENTRY_THRESHOLD <= price <= MOMENTUM_ENTRY_RETRY_MAX
+                if not retryable:
+                    self._entry_attempted = True
+                retry_note = f"retrying in {MOMENTUM_ENTRY_RETRY_COOLDOWN:.0f}s" if retryable else "price left retry range; no retry"
                 self._on_log("⏸", (
-                    f"MOMENTUM ENTRY {self.asset} {side.upper()} {price}¢ — IOC no fill "
-                    f"(book moved; no retry this window)"
+                    f"MOMENTUM ENTRY {self.asset} {side.upper()} {price}¢ — IOC no fill ({retry_note})"
                 ))
         except Exception as e:
             self._on_log("✗", f"MOMENTUM ENTRY error {self.asset}: {e}")
