@@ -783,7 +783,7 @@ function handleMsg(msg) {
       if (s && s.secs_left != null)
         S.assetTimers[a] = { secsLeft: s.secs_left, capturedAt: performance.now() };
     });
-    renderMarkets(); checkArbSignals(); updateScanBar();
+    renderMarkets(); if (!S.momentumMode) checkArbSignals(); updateScanBar();
     if (S.momentumMode) renderMomentumRow();
   } else if (t === 'momentum_update') {
     S.momentumPositions[msg.asset] = msg.position;
@@ -1001,7 +1001,7 @@ function renderMcard(asset) {
   const ticker   = (s.ticker || '').slice(-22);
   const combined = yA != null && nA != null ? yA + nA : null;
   const tGap     = s.taker_gap != null ? parseFloat(s.taker_gap) : null;
-  const isArb    = tGap != null && tGap > 0;
+  const isArb    = !S.momentumMode && tGap != null && tGap > 0;
   const tGapStr  = tGap != null
     ? (tGap > 0 ? '+' : '') + tGap.toFixed(2) + '¢'
     : combined != null ? (100 - combined).toFixed(0) + '¢ raw' : '—';
