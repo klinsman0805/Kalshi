@@ -643,7 +643,7 @@ class MomentumTrader:
                         self._on_log("⏱", (
                             f"MOMENTUM {self.asset} entry window open  "
                             f"elapsed={elapsed}s  secs_left={snap.secs_left}  "
-                            f"YES_bid={snap.yes_bid}¢  NO_bid={snap.no_bid}¢"
+                            f"YES_ask={snap.yes_ask}¢  NO_ask={snap.no_ask}¢"
                         ))
                     if now - self._entry_last_ts >= MOMENTUM_ENTRY_RETRY_COOLDOWN:
                         self._try_entry(snap)
@@ -707,20 +707,26 @@ class MomentumTrader:
         self._on_update(self.asset, dict(self._position) if self._position else None)
 
     def _try_entry(self, snap):
-        """IOC buy at best qualifying bid. Must hold _lock."""
-        yes_ok = snap.yes_bid is not None and snap.yes_bid >= MOMENTUM_ENTRY_THRESHOLD
-        no_ok  = snap.no_bid  is not None and snap.no_bid  >= MOMENTUM_ENTRY_THRESHOLD
+        """IOC buy the dominant side when its ASK price is >= MOMENTUM_ENTRY_THRESHOLD.
+        We check the ASK (= 100 - opposite_bid), not the bid, because:
+          - yes_ask is the actual cost to buy YES as a taker
+          - yes_ask >= threshold means the market prices YES probability at >= threshold
+          - Using yes_bid would set the order below the ask → either no fill (bid < ask)
+            or a surprise fill at the lower ask price with a wrongly recorded entry_price
+        """
+        yes_ok = snap.yes_ask is not None and snap.yes_ask >= MOMENTUM_ENTRY_THRESHOLD
+        no_ok  = snap.no_ask  is not None and snap.no_ask  >= MOMENTUM_ENTRY_THRESHOLD
         if not yes_ok and not no_ok:
             return  # no qualifying side yet; will retry next tick within window
 
         if yes_ok and no_ok:
-            side = "yes" if snap.yes_bid >= snap.no_bid else "no"
+            side = "yes" if snap.yes_ask >= snap.no_ask else "no"
         elif yes_ok:
             side = "yes"
         else:
             side = "no"
 
-        price = snap.yes_bid if side == "yes" else snap.no_bid
+        price = snap.yes_ask if side == "yes" else snap.no_ask
         n     = TRADE_SIZE_CONTRACTS
         cid   = _make_client_id(self.asset, f"mom-{side}")
 
