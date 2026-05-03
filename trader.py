@@ -384,6 +384,7 @@ def execute_arb(snap, mkt: dict, bot=None) -> Optional[dict]:
     if snap.secs_left < MIN_SECS_LEFT:
         result["status"] = "skipped_near_expiry"
         result["error"]  = f"only {snap.secs_left}s left in window (min {MIN_SECS_LEFT}s)"
+        log.info("ARB skip %s: near_expiry (%ds left, min %ds)", asset, snap.secs_left, MIN_SECS_LEFT)
         return result
 
     # Skip if there is no depth at the ask level on either side
@@ -391,12 +392,16 @@ def execute_arb(snap, mkt: dict, bot=None) -> Optional[dict]:
         result["status"] = "skipped_no_depth"
         result["error"]  = (f"yes_depth={snap.yes_ask_depth} "
                             f"no_depth={snap.no_ask_depth} — book too thin to fill")
+        log.info("ARB skip %s: no_depth  yes_depth=%d  no_depth=%d  YES=%d¢  NO=%d¢",
+                 asset, snap.yes_ask_depth, snap.no_ask_depth, snap.yes_ask, snap.no_ask)
         return result
 
     # Position limits (use depth-capped n)
     if POSITIONS.total_exposure(ticker) + n * 2 > MAX_POSITION_CONTRACTS:
         result["status"] = "skipped_position_limit"
         result["error"]  = f"exposure {POSITIONS.total_exposure(ticker)} + {n*2} > max {MAX_POSITION_CONTRACTS}"
+        log.warning("ARB skip %s: position_limit  exposure=%d + %d > max %d",
+                    asset, POSITIONS.total_exposure(ticker), n * 2, MAX_POSITION_CONTRACTS)
         return result
 
     # ── Guardrail 1: per-asset cooldown + circuit breaker ─────────────────────
@@ -603,11 +608,13 @@ class MomentumTrader:
         self._on_update = on_update or (lambda asset, pos: None)
 
         self._position: Optional[dict] = None
-        self._entry_attempted = False
-        self._entry_last_ts   = 0.0
-        self._tp_last_ts      = 0.0
-        self._hedge_last_ts   = 0.0
-        self._hedge_attempted = False
+        self._entry_attempted     = False
+        self._entry_last_ts       = 0.0
+        self._entry_window_logged = False
+        self._tp_last_ts          = 0.0
+        self._tp_window_logged    = False
+        self._hedge_last_ts       = 0.0
+        self._hedge_attempted     = False
         self._current_ticker: Optional[str] = None
 
     # ── Public ────────────────────────────────────────────────────────────────
@@ -631,6 +638,13 @@ class MomentumTrader:
             # Phase 1: entry window
             if pos is None and not self._entry_attempted:
                 if MOMENTUM_ENTRY_START <= elapsed <= MOMENTUM_ENTRY_END:
+                    if not self._entry_window_logged:
+                        self._entry_window_logged = True
+                        self._on_log("⏱", (
+                            f"MOMENTUM {self.asset} entry window open  "
+                            f"elapsed={elapsed}s  secs_left={snap.secs_left}  "
+                            f"YES_bid={snap.yes_bid}¢  NO_bid={snap.no_bid}¢"
+                        ))
                     if now - self._entry_last_ts >= MOMENTUM_ENTRY_RETRY_COOLDOWN:
                         self._try_entry(snap)
 
@@ -639,6 +653,15 @@ class MomentumTrader:
             if (pos is not None and pos["phase"] == "holding"
                     and snap.secs_left <= 60
                     and now - self._tp_last_ts >= MOMENTUM_TP_COOLDOWN):
+                if not self._tp_window_logged:
+                    self._tp_window_logged = True
+                    side        = pos["side"]
+                    current_bid = snap.yes_bid if side == "yes" else snap.no_bid
+                    self._on_log("⏱", (
+                        f"MOMENTUM {self.asset} TP window open  "
+                        f"holding {side.upper()} entry={pos['entry_price']}¢  "
+                        f"bid={current_bid}¢  target={MOMENTUM_TAKE_PROFIT}¢  secs_left={snap.secs_left}"
+                    ))
                 self._try_take_profit(snap)
 
             # Phase 3: reversal hedge
@@ -670,12 +693,14 @@ class MomentumTrader:
 
     def _reset_window(self):
         """Clear per-window state. Must hold _lock."""
-        self._position        = None
-        self._entry_attempted = False
-        self._entry_last_ts   = 0.0
-        self._tp_last_ts      = 0.0
-        self._hedge_last_ts   = 0.0
-        self._hedge_attempted = False
+        self._position            = None
+        self._entry_attempted     = False
+        self._entry_last_ts       = 0.0
+        self._entry_window_logged = False
+        self._tp_last_ts          = 0.0
+        self._tp_window_logged    = False
+        self._hedge_last_ts       = 0.0
+        self._hedge_attempted     = False
 
     def _notify(self):
         """Push position update to app layer. Must hold _lock."""
@@ -776,6 +801,12 @@ class MomentumTrader:
 
         current_bid = snap.yes_bid if side == "yes" else snap.no_bid
         if current_bid is None or current_bid < MOMENTUM_TAKE_PROFIT:
+            if current_bid is not None:
+                self._on_log("⏳", (
+                    f"MOMENTUM TP {self.asset} {side.upper()}  "
+                    f"bid={current_bid}¢  need={MOMENTUM_TAKE_PROFIT}¢  "
+                    f"gap={MOMENTUM_TAKE_PROFIT - current_bid}¢  secs_left={snap.secs_left}"
+                ))
             return  # target not reached yet; will retry after cooldown
 
         n          = pos["count"]
@@ -855,7 +886,11 @@ class MomentumTrader:
         hedge_threshold = 100 - entry_price - MOMENTUM_HEDGE_MIN_GAP
 
         if hedge_ask is None or hedge_ask >= hedge_threshold:
-            # Gap not wide enough (or no book); mark attempted to skip costly retries.
+            self._on_log("↘", (
+                f"MOMENTUM REVERSAL {self.asset}  {side.upper()} dropped "
+                f"{entry_price - current_bid}¢ (entry={entry_price}¢ → now={current_bid}¢)  "
+                f"hedge {hedge_side.upper()} ask={hedge_ask}¢  max={hedge_threshold - 1}¢ — too expensive"
+            ))
             self._hedge_attempted = True
             return
 

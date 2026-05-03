@@ -813,9 +813,15 @@ class BotEngine:
             book = self._books.get(ticker)
             if book is None:
                 return
+            was_ready = book.ready
             book.apply_snapshot(body)
             asset = self._ticker_map.get(ticker)
         if asset:
+            if not was_ready:
+                self.on_log("📖", (
+                    f"{asset} orderbook ready  "
+                    f"yes_levels={len(book.yes_bids)}  no_levels={len(book.no_bids)}"
+                ))
             self._compute_and_push(asset)
 
     def _handle_delta(self, body: dict):
@@ -974,8 +980,8 @@ class BotEngine:
                         book.ready = True
                     self.update_count += 1
                     self._compute_and_push(asset)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("REST poll error %s: %s", asset, e)
 
     def _on_ws_error(self, ws, error):
         self.on_log("✗", f"WS error: {error}")
