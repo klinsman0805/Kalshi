@@ -13,6 +13,10 @@ Tests cover:
   6. PositionBook tracking
   7. DRY_RUN order execution path
   8. BotEngine callbacks (no real WS)
+  9. ArbStats rolling statistics
+ 10. Guardrails (cooldown, circuit breaker, concurrency, live order paths)
+ 11. Live-readiness checklist (env, keys, fee constants, DRY_RUN flag)
+ 12. MomentumTrader (entry, take-profit, reversal hedge, window reset, live orders)
 """
 
 import json
@@ -542,6 +546,31 @@ _ARB_MKT = {"ticker": "KXBTCD-15MIN-12345",
             "window_ts": 12345}
 
 
+def _make_momentum_snap(yes_bid=None, no_bid=None, secs_left=100,
+                        ticker="KXBTCD-15MIN-12345",
+                        override_no_ask=None, override_yes_ask=None
+                        ) -> engine.MarketSnapshot:
+    """
+    Build a MarketSnapshot for MomentumTrader tests.
+
+    override_no_ask / override_yes_ask let tests force ask prices that cannot
+    be produced by the standard implied-ask formula (100 - opposite_bid), which
+    is needed to test the reversal-hedge branch in isolation.
+    """
+    book = engine.LocalBook(ticker)
+    if yes_bid is not None:
+        book.yes_bids = {yes_bid: 10}
+    if no_bid is not None:
+        book.no_bids = {no_bid: 10}
+    book.ready = True
+    snap = engine.MarketSnapshot("BTC", ticker, book, 12345, secs_left)
+    if override_no_ask is not None:
+        snap.no_ask = override_no_ask
+    if override_yes_ask is not None:
+        snap.yes_ask = override_yes_ask
+    return snap
+
+
 # ==============================================================================
 # 9. ArbStats Tests
 # ==============================================================================
@@ -949,6 +978,509 @@ class TestLiveReadiness(unittest.TestCase):
         """Confirm DRY_RUN is forced true in the test suite."""
         self.assertTrue(engine.DRY_RUN,
                         "DRY_RUN is False during test run — this is unsafe")
+
+
+# ==============================================================================
+# 12. MomentumTrader Tests
+# ==============================================================================
+
+# ── Entry phase ───────────────────────────────────────────────────────────────
+class TestMomentumTraderEntry(unittest.TestCase):
+    """Phase 1: IOC buy in the 780–840 s elapsed window (13th–14th minute)."""
+
+    def _make_trader(self):
+        return trader.MomentumTrader("BTC",
+                                     on_log=lambda i, m: None,
+                                     on_update=lambda a, p: None)
+
+    def test_no_entry_before_window(self):
+        """No entry when elapsed < MOMENTUM_ENTRY_START (780 s)."""
+        mt   = self._make_trader()
+        # yes_bid=10 → yes_ask=90 >= 85 (qualifies), but elapsed=779 < 780
+        snap = _make_momentum_snap(yes_bid=10, no_bid=10, secs_left=121)  # elapsed=779
+        mt.update(snap, {})
+        self.assertIsNone(mt.get_position())
+        self.assertFalse(mt._entry_attempted)
+
+    def test_no_entry_after_window(self):
+        """No entry when elapsed > MOMENTUM_ENTRY_END (840 s)."""
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=10, no_bid=10, secs_left=59)   # elapsed=841
+        mt.update(snap, {})
+        self.assertIsNone(mt.get_position())
+        self.assertFalse(mt._entry_attempted)
+
+    def test_no_entry_when_both_asks_below_threshold(self):
+        """No entry when both implied asks < MOMENTUM_ENTRY_THRESHOLD (85 ¢).
+
+        Entry uses ask prices (cost to buy), not bids.
+        yes_ask = 100 - no_bid;  no_ask = 100 - yes_bid.
+        With yes_bid=50, no_bid=50: yes_ask=50 and no_ask=50 — both below 85.
+        """
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=50, no_bid=50, secs_left=100)  # elapsed=800
+        mt.update(snap, {})
+        self.assertIsNone(mt.get_position())
+        self.assertFalse(mt._entry_attempted)
+
+    def test_entry_fires_yes_when_only_yes_qualifies(self):
+        """Entry fires on YES when yes_ask >= 85 ¢ and no_ask < 85 ¢.
+
+        yes_bid=50, no_bid=10  →  yes_ask=90 (≥85), no_ask=50 (<85).
+        Entry price is the ask price paid (90 ¢), not the bid.
+        """
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=50, no_bid=10, secs_left=100)
+        mt.update(snap, {})
+        pos = mt.get_position()
+        self.assertIsNotNone(pos)
+        self.assertEqual(pos["side"], "yes")
+        self.assertEqual(pos["entry_price"], 90)   # yes_ask = 100 - 10
+        self.assertEqual(pos["phase"], "holding")
+
+    def test_entry_fires_no_when_only_no_qualifies(self):
+        """Entry fires on NO when no_ask >= 85 ¢ and yes_ask < 85 ¢.
+
+        yes_bid=10, no_bid=50  →  yes_ask=50 (<85), no_ask=90 (≥85).
+        """
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=10, no_bid=50, secs_left=100)
+        mt.update(snap, {})
+        pos = mt.get_position()
+        self.assertIsNotNone(pos)
+        self.assertEqual(pos["side"], "no")
+        self.assertEqual(pos["entry_price"], 90)   # no_ask = 100 - 10
+
+    def test_entry_prefers_higher_ask_yes(self):
+        """When both qualify, entry takes the side with the higher ask (YES here).
+
+        yes_bid=12, no_bid=10  →  yes_ask=90, no_ask=88  →  YES selected.
+        """
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=12, no_bid=10, secs_left=100)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["side"], "yes")
+
+    def test_entry_prefers_higher_ask_no(self):
+        """When both qualify, entry takes the side with the higher ask (NO here).
+
+        yes_bid=10, no_bid=12  →  yes_ask=88, no_ask=90  →  NO selected.
+        """
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=10, no_bid=12, secs_left=100)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["side"], "no")
+
+    def test_entry_fires_only_once_per_window(self):
+        """A second tick inside the entry window does not replace the position."""
+        mt    = self._make_trader()
+        snap1 = _make_momentum_snap(yes_bid=10, no_bid=10, secs_left=100)  # yes_ask=90
+        mt.update(snap1, {})
+        first_price = mt.get_position()["entry_price"]
+
+        snap2 = _make_momentum_snap(yes_bid=8, no_bid=8, secs_left=95)  # yes_ask=92, still in window
+        mt.update(snap2, {})
+        self.assertEqual(mt.get_position()["entry_price"], first_price)
+
+    def test_entry_count_equals_trade_size_contracts(self):
+        """Entry fills exactly TRADE_SIZE_CONTRACTS contracts."""
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=10, no_bid=10, secs_left=100)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["count"], trader.TRADE_SIZE_CONTRACTS)
+
+    def test_entry_position_has_all_required_fields(self):
+        """Position dict exposes all required fields after a dry-run entry."""
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=10, no_bid=10, secs_left=100)
+        mt.update(snap, {})
+        pos = mt.get_position()
+        for field in ["ticker", "side", "entry_price", "count", "entry_ts",
+                      "phase", "hedge_price", "hedge_count"]:
+            self.assertIn(field, pos, f"Missing field: {field}")
+        self.assertIsNone(pos["hedge_price"])
+        self.assertIsNone(pos["hedge_count"])
+
+    def test_get_position_returns_copy(self):
+        """get_position() returns a copy — mutating it does not affect internal state."""
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=10, no_bid=10, secs_left=100)
+        mt.update(snap, {})
+        copy = mt.get_position()
+        copy["phase"] = "TAMPERED"
+        self.assertEqual(mt.get_position()["phase"], "holding")
+
+    def test_get_position_returns_none_initially(self):
+        """Fresh MomentumTrader has no position."""
+        self.assertIsNone(self._make_trader().get_position())
+
+    def test_on_update_callback_invoked_on_entry(self):
+        """on_update callback fires once with (asset, position) on entry."""
+        updates = []
+        mt = trader.MomentumTrader("BTC",
+                                   on_log=lambda i, m: None,
+                                   on_update=lambda a, p: updates.append((a, p)))
+        mt.update(_make_momentum_snap(yes_bid=10, no_bid=10, secs_left=100), {})
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0][0], "BTC")
+        self.assertIsNotNone(updates[0][1])
+
+
+# ── Take-profit phase ─────────────────────────────────────────────────────────
+class TestMomentumTraderTakeProfit(unittest.TestCase):
+    """Phase 2: IOC sell when bid >= MOMENTUM_TAKE_PROFIT in the last 60 s."""
+
+    def _make_trader_holding(self, side="yes", entry_price=85):
+        """MomentumTrader pre-loaded with a 'holding' position."""
+        mt = trader.MomentumTrader("BTC",
+                                   on_log=lambda i, m: None,
+                                   on_update=lambda a, p: None)
+        mt._entry_attempted = True
+        mt._current_ticker  = "KXBTCD-15MIN-12345"
+        mt._position = {
+            "ticker": "KXBTCD-15MIN-12345",
+            "side": side, "entry_price": entry_price, "count": 5,
+            "entry_ts": "2026-01-01T00:00:00Z", "phase": "holding",
+            "hedge_price": None, "hedge_count": None,
+        }
+        return mt
+
+    def test_tp_does_not_fire_when_secs_left_above_60(self):
+        """TP phase is only active when secs_left <= 60."""
+        mt   = self._make_trader_holding("yes", 85)
+        snap = _make_momentum_snap(yes_bid=96, secs_left=90)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "holding")
+
+    def test_tp_does_not_fire_when_bid_below_target(self):
+        """TP does not trigger when bid < MOMENTUM_TAKE_PROFIT (95 ¢)."""
+        mt   = self._make_trader_holding("yes", 85)
+        snap = _make_momentum_snap(yes_bid=94, secs_left=30)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "holding")
+
+    def test_tp_fires_when_yes_bid_reaches_target(self):
+        """DRY_RUN: TP closes YES position when bid >= 95 ¢ in last 60 s."""
+        mt   = self._make_trader_holding("yes", 85)
+        snap = _make_momentum_snap(yes_bid=95, secs_left=30)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "closed")
+
+    def test_tp_fires_on_no_side(self):
+        """DRY_RUN: TP closes NO position when NO bid >= 95 ¢."""
+        mt   = self._make_trader_holding("no", 87)
+        snap = _make_momentum_snap(no_bid=96, secs_left=30)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "closed")
+
+    def test_tp_respects_cooldown(self):
+        """TP attempt is suppressed within MOMENTUM_TP_COOLDOWN seconds of prior try."""
+        mt = self._make_trader_holding("yes", 85)
+        mt._tp_last_ts = time.time()          # simulate a very recent attempt
+        snap = _make_momentum_snap(yes_bid=96, secs_left=30)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "holding")
+
+    def test_tp_does_not_fire_when_phase_is_hedged(self):
+        """TP only runs while phase == 'holding'; skips if already hedged."""
+        mt = self._make_trader_holding("yes", 85)
+        mt._position["phase"] = "hedged"
+        snap = _make_momentum_snap(yes_bid=97, secs_left=30)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "hedged")
+
+
+# ── Reversal-hedge phase ──────────────────────────────────────────────────────
+class TestMomentumTraderHedge(unittest.TestCase):
+    """
+    Phase 3: IOC buy opposite side when:
+      - entry-side bid dropped >= MOMENTUM_REVERSAL_DROP from entry price, AND
+      - opposite ask < (100 - entry_price - MOMENTUM_HEDGE_MIN_GAP)
+    """
+
+    def _make_trader_holding(self, side="yes", entry_price=85):
+        mt = trader.MomentumTrader("BTC",
+                                   on_log=lambda i, m: None,
+                                   on_update=lambda a, p: None)
+        mt._entry_attempted = True
+        mt._current_ticker  = "KXBTCD-15MIN-12345"
+        mt._position = {
+            "ticker": "KXBTCD-15MIN-12345",
+            "side": side, "entry_price": entry_price, "count": 5,
+            "entry_ts": "2026-01-01T00:00:00Z", "phase": "holding",
+            "hedge_price": None, "hedge_count": None,
+        }
+        return mt
+
+    def test_hedge_skipped_when_drop_insufficient(self):
+        """Hedge not triggered when entry-side drop < MOMENTUM_REVERSAL_DROP (10 ¢)."""
+        mt   = self._make_trader_holding("yes", entry_price=85)
+        # YES bid=76 → drop=9 < 10
+        snap = _make_momentum_snap(yes_bid=76, secs_left=30)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "holding")
+        self.assertFalse(mt._hedge_attempted)
+
+    def test_hedge_marks_attempted_when_ask_too_high(self):
+        """When drop is sufficient but opposite ask >= threshold, hedge_attempted is set."""
+        mt   = self._make_trader_holding("yes", entry_price=85)
+        # YES bid=70 → drop=15 >= 10; implied NO ask = 100-70 = 30 >= threshold(10)
+        snap = _make_momentum_snap(yes_bid=70, secs_left=30)
+        mt.update(snap, {})
+        self.assertTrue(mt._hedge_attempted)
+        self.assertEqual(mt.get_position()["phase"], "holding")  # no fill
+
+    def test_hedge_fires_when_opposite_ask_below_threshold(self):
+        """
+        DRY_RUN: hedge fires when drop >= 10 AND opposite ask < threshold.
+
+        The implied NO ask (100 - yes_bid) is always >= threshold when the drop
+        condition holds in a fair book, so we override snap.no_ask directly to
+        test this branch in isolation.
+        """
+        mt   = self._make_trader_holding("yes", entry_price=85)
+        # YES bid=70 (drop=15 >= 10); override NO ask to 8 ¢ (< threshold=10)
+        snap = _make_momentum_snap(yes_bid=70, secs_left=30, override_no_ask=8)
+        mt.update(snap, {})
+        pos = mt.get_position()
+        self.assertEqual(pos["phase"], "hedged")
+        self.assertEqual(pos["hedge_price"], 8)
+        self.assertEqual(pos["hedge_count"], 5)
+
+    def test_hedge_threshold_uses_entry_price(self):
+        """Threshold = 100 - entry_price - MOMENTUM_HEDGE_MIN_GAP (not current price)."""
+        # entry=90, gap=5 → threshold=5; YES bid=79 (drop=11 >= 10); NO ask=4 (< 5)
+        mt   = self._make_trader_holding("yes", entry_price=90)
+        snap = _make_momentum_snap(yes_bid=79, secs_left=30, override_no_ask=4)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "hedged")
+        self.assertEqual(mt.get_position()["hedge_price"], 4)
+
+    def test_hedge_fires_only_once_per_window(self):
+        """_hedge_attempted flag prevents a second hedge attempt in the same window."""
+        mt = self._make_trader_holding("yes", entry_price=85)
+        mt._hedge_attempted = True
+        snap = _make_momentum_snap(yes_bid=70, secs_left=30, override_no_ask=8)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "holding")
+
+    def test_hedge_skipped_when_secs_left_above_60(self):
+        """Hedge phase is only active in the last 60 s."""
+        mt   = self._make_trader_holding("yes", entry_price=85)
+        snap = _make_momentum_snap(yes_bid=70, secs_left=90, override_no_ask=8)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "holding")
+        self.assertFalse(mt._hedge_attempted)
+
+    def test_hedge_skipped_when_phase_is_not_holding(self):
+        """Hedge only runs while phase == 'holding'."""
+        mt = self._make_trader_holding("yes", entry_price=85)
+        mt._position["phase"] = "closed"
+        snap = _make_momentum_snap(yes_bid=70, secs_left=30, override_no_ask=8)
+        mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "closed")
+
+    def test_hedge_no_side_entry(self):
+        """DRY_RUN: hedge fires on YES side when holding NO and NO bid drops."""
+        mt   = self._make_trader_holding("no", entry_price=87)
+        # NO bid=76 (drop=11 >= 10); override YES ask to 6 ¢ (< threshold=8)
+        snap = _make_momentum_snap(no_bid=76, secs_left=30, override_yes_ask=6)
+        mt.update(snap, {})
+        pos = mt.get_position()
+        self.assertEqual(pos["phase"], "hedged")
+        self.assertEqual(pos["hedge_price"], 6)
+
+
+# ── Window reset ──────────────────────────────────────────────────────────────
+class TestMomentumTraderWindowReset(unittest.TestCase):
+
+    def _make_trader_holding(self):
+        mt = trader.MomentumTrader("BTC",
+                                   on_log=lambda i, m: None,
+                                   on_update=lambda a, p: None)
+        mt._entry_attempted  = True
+        mt._hedge_attempted  = True
+        mt._tp_last_ts       = time.time()
+        mt._hedge_last_ts    = time.time()
+        mt._current_ticker   = "KXBTCD-15MIN-12345"
+        mt._position = {
+            "ticker": "KXBTCD-15MIN-12345",
+            "side": "yes", "entry_price": 85, "count": 5,
+            "entry_ts": "2026-01-01T00:00:00Z", "phase": "holding",
+            "hedge_price": None, "hedge_count": None,
+        }
+        return mt
+
+    def test_on_market_expire_clears_position(self):
+        mt = self._make_trader_holding()
+        mt.on_market_expire("KXBTCD-15MIN-12345")
+        self.assertIsNone(mt.get_position())
+
+    def test_on_market_expire_resets_all_state(self):
+        mt = self._make_trader_holding()
+        mt.on_market_expire("KXBTCD-15MIN-12345")
+        self.assertFalse(mt._entry_attempted)
+        self.assertFalse(mt._hedge_attempted)
+        self.assertEqual(mt._tp_last_ts, 0.0)
+        self.assertEqual(mt._hedge_last_ts, 0.0)
+
+    def test_on_market_expire_with_no_position_is_safe(self):
+        """on_market_expire does not raise when no position is held."""
+        mt = trader.MomentumTrader("BTC",
+                                   on_log=lambda i, m: None,
+                                   on_update=lambda a, p: None)
+        mt._current_ticker = "KXBTCD-15MIN-12345"
+        mt.on_market_expire("KXBTCD-15MIN-12345")   # must not raise
+        self.assertIsNone(mt.get_position())
+
+    def test_ticker_change_resets_window(self):
+        """When a new market ticker arrives, prior window state is cleared."""
+        mt   = self._make_trader_holding()
+        snap = _make_momentum_snap(yes_bid=50, secs_left=500,
+                                   ticker="KXBTCD-15MIN-99999")
+        mt.update(snap, {})
+        self.assertIsNone(mt.get_position())
+        self.assertFalse(mt._entry_attempted)
+
+
+# ── Live-order paths (mocked _post_order) ─────────────────────────────────────
+class TestMomentumTraderLiveOrders(unittest.TestCase):
+    """
+    Exercises the non-dry-run branches of MomentumTrader by mocking _post_order.
+    DRY_RUN is temporarily set False and restored in tearDown.
+    """
+
+    def setUp(self):
+        self._orig_dry = trader.DRY_RUN
+
+    def tearDown(self):
+        trader.DRY_RUN = trader.DRY_RUN   # no-op, but explicit
+        trader.DRY_RUN = self._orig_dry
+        trader.POSITIONS._data["positions"].pop("KXBTCD-15MIN-12345", None)
+
+    def _make_trader(self):
+        return trader.MomentumTrader("BTC",
+                                     on_log=lambda i, m: None,
+                                     on_update=lambda a, p: None)
+
+    def _fake_resp(self, fill_count):
+        return {"order": {"order_id": "o1", "status": "executed",
+                          "fill_count_fp": str(float(fill_count))}}
+
+    # Entry
+    def test_live_entry_fill_sets_position(self):
+        """Filled IOC buy creates a 'holding' position.
+
+        yes_bid=12, no_bid=12  →  yes_ask=88, no_ask=88  →  YES selected, entry_price=88.
+        """
+        import unittest.mock as mock
+        trader.DRY_RUN = False
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=12, no_bid=12, secs_left=100)
+        with mock.patch.object(trader, "_post_order", return_value=self._fake_resp(5)):
+            with mock.patch.object(trader, "_log_trade"):
+                mt.update(snap, {})
+        pos = mt.get_position()
+        self.assertIsNotNone(pos)
+        self.assertEqual(pos["phase"], "holding")
+        self.assertEqual(pos["count"], 5)
+
+    def test_live_entry_no_fill_outside_retry_range_marks_attempted(self):
+        """Zero-fill at a price above MOMENTUM_ENTRY_RETRY_MAX permanently stops retries.
+
+        yes_bid=50, no_bid=6  →  yes_ask=94 > RETRY_MAX(90)  →  not retryable
+        → _entry_attempted=True after zero fill.
+        """
+        import unittest.mock as mock
+        trader.DRY_RUN = False
+        mt   = self._make_trader()
+        snap = _make_momentum_snap(yes_bid=50, no_bid=6, secs_left=100)
+        with mock.patch.object(trader, "_post_order", return_value=self._fake_resp(0)):
+            with mock.patch.object(trader, "_log_trade"):
+                mt.update(snap, {})
+        self.assertIsNone(mt.get_position())
+        self.assertTrue(mt._entry_attempted)
+
+    # Take-profit
+    def test_live_tp_fill_closes_position(self):
+        """Filled IOC sell transitions phase to 'closed'."""
+        import unittest.mock as mock
+        trader.DRY_RUN = False
+        mt = self._make_trader()
+        mt._entry_attempted = True
+        mt._current_ticker  = "KXBTCD-15MIN-12345"
+        mt._position = {
+            "ticker": "KXBTCD-15MIN-12345",
+            "side": "yes", "entry_price": 85, "count": 5,
+            "entry_ts": "2026-01-01T00:00:00Z", "phase": "holding",
+            "hedge_price": None, "hedge_count": None,
+        }
+        snap = _make_momentum_snap(yes_bid=96, secs_left=30)
+        with mock.patch.object(trader, "_post_order", return_value=self._fake_resp(5)):
+            with mock.patch.object(trader, "_log_trade"):
+                mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "closed")
+
+    def test_live_tp_no_fill_keeps_holding(self):
+        """Zero-fill IOC sell keeps phase as 'holding' for next retry."""
+        import unittest.mock as mock
+        trader.DRY_RUN = False
+        mt = self._make_trader()
+        mt._entry_attempted = True
+        mt._current_ticker  = "KXBTCD-15MIN-12345"
+        mt._position = {
+            "ticker": "KXBTCD-15MIN-12345",
+            "side": "yes", "entry_price": 85, "count": 5,
+            "entry_ts": "2026-01-01T00:00:00Z", "phase": "holding",
+            "hedge_price": None, "hedge_count": None,
+        }
+        snap = _make_momentum_snap(yes_bid=96, secs_left=30)
+        with mock.patch.object(trader, "_post_order", return_value=self._fake_resp(0)):
+            with mock.patch.object(trader, "_log_trade"):
+                mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "holding")
+
+    # Reversal hedge
+    def test_live_hedge_fill_sets_hedged_phase(self):
+        """Filled IOC hedge buy transitions phase to 'hedged' and records price."""
+        import unittest.mock as mock
+        trader.DRY_RUN = False
+        mt = self._make_trader()
+        mt._entry_attempted = True
+        mt._current_ticker  = "KXBTCD-15MIN-12345"
+        mt._position = {
+            "ticker": "KXBTCD-15MIN-12345",
+            "side": "yes", "entry_price": 85, "count": 5,
+            "entry_ts": "2026-01-01T00:00:00Z", "phase": "holding",
+            "hedge_price": None, "hedge_count": None,
+        }
+        snap = _make_momentum_snap(yes_bid=70, secs_left=30, override_no_ask=8)
+        with mock.patch.object(trader, "_post_order", return_value=self._fake_resp(5)):
+            with mock.patch.object(trader, "_log_trade"):
+                mt.update(snap, {})
+        pos = mt.get_position()
+        self.assertEqual(pos["phase"], "hedged")
+        self.assertEqual(pos["hedge_price"], 8)
+
+    def test_live_hedge_no_fill_allows_retry(self):
+        """Zero-fill hedge IOC clears hedge_attempted so the next tick can retry."""
+        import unittest.mock as mock
+        trader.DRY_RUN = False
+        mt = self._make_trader()
+        mt._entry_attempted = True
+        mt._current_ticker  = "KXBTCD-15MIN-12345"
+        mt._position = {
+            "ticker": "KXBTCD-15MIN-12345",
+            "side": "yes", "entry_price": 85, "count": 5,
+            "entry_ts": "2026-01-01T00:00:00Z", "phase": "holding",
+            "hedge_price": None, "hedge_count": None,
+        }
+        snap = _make_momentum_snap(yes_bid=70, secs_left=30, override_no_ask=8)
+        with mock.patch.object(trader, "_post_order", return_value=self._fake_resp(0)):
+            with mock.patch.object(trader, "_log_trade"):
+                mt.update(snap, {})
+        self.assertEqual(mt.get_position()["phase"], "holding")
+        self.assertFalse(mt._hedge_attempted)   # cleared → retry allowed
 
 
 if __name__ == "__main__":

@@ -1243,7 +1243,6 @@ function esc(s) {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 updateMode();
-updateMakerMode();
 renderMarkets();
 connectSSE();
 setInterval(refreshTrades, 5000);
