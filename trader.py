@@ -83,8 +83,9 @@ MIN_SECS_LEFT         = int(os.getenv("MIN_SECS_LEFT",           "60"))
 # TP:     IOC sell when bid >= MOMENTUM_TAKE_PROFIT in the last 60 s.
 # Hedge:  IOC buy opposite side when entry side dropped >= REVERSAL_DROP AND
 #         opposite ask <= (100 - entry_price), keeping combined cost <= 100¢.
-MOMENTUM_ENTRY_THRESHOLD = int(os.getenv("MOMENTUM_ENTRY_THRESHOLD", "85"))   # ¢ bid to trigger entry
-MOMENTUM_TAKE_PROFIT     = int(os.getenv("MOMENTUM_TAKE_PROFIT",     "95"))   # ¢ bid at which to sell
+MOMENTUM_ENTRY_THRESHOLD = int(os.getenv("MOMENTUM_ENTRY_THRESHOLD", "85"))   # ¢ ask floor to trigger entry
+MOMENTUM_ENTRY_MAX       = int(os.getenv("MOMENTUM_ENTRY_MAX",       "95"))   # ¢ ask ceiling — skip if at/above this (bad risk/reward)
+MOMENTUM_TAKE_PROFIT     = int(os.getenv("MOMENTUM_TAKE_PROFIT",     "95"))   # ¢ bid at which to sell (must beat entry_price)
 MOMENTUM_ENTRY_START     = int(os.getenv("MOMENTUM_ENTRY_START",     "780"))  # window elapsed secs (13:00)
 MOMENTUM_ENTRY_END       = int(os.getenv("MOMENTUM_ENTRY_END",       "840"))  # window elapsed secs (14:00)
 MOMENTUM_REVERSAL_DROP   = int(os.getenv("MOMENTUM_REVERSAL_DROP",   "10"))   # ¢ drop from entry to begin watching for hedge
@@ -727,6 +728,14 @@ class MomentumTrader:
             side = "no"
 
         price = snap.yes_ask if side == "yes" else snap.no_ask
+        if price >= MOMENTUM_ENTRY_MAX:
+            self._entry_attempted = True
+            self._on_log("⏭", (
+                f"MOMENTUM ENTRY {self.asset} {side.upper()} skipped — ask={price}¢ >= max={MOMENTUM_ENTRY_MAX}¢ "
+                f"(bad risk/reward: TP target already below entry)"
+            ))
+            return
+
         n     = TRADE_SIZE_CONTRACTS
         cid   = _make_client_id(self.asset, f"mom-{side}")
 
@@ -806,12 +815,13 @@ class MomentumTrader:
         side = pos["side"]
 
         current_bid = snap.yes_bid if side == "yes" else snap.no_bid
-        if current_bid is None or current_bid < MOMENTUM_TAKE_PROFIT:
+        tp_target   = max(MOMENTUM_TAKE_PROFIT, pos["entry_price"] + 1)
+        if current_bid is None or current_bid < tp_target:
             if current_bid is not None:
                 self._on_log("⏳", (
                     f"MOMENTUM TP {self.asset} {side.upper()}  "
-                    f"bid={current_bid}¢  need={MOMENTUM_TAKE_PROFIT}¢  "
-                    f"gap={MOMENTUM_TAKE_PROFIT - current_bid}¢  secs_left={snap.secs_left}"
+                    f"bid={current_bid}¢  need={tp_target}¢  "
+                    f"gap={tp_target - current_bid}¢  secs_left={snap.secs_left}"
                 ))
             return  # target not reached yet; will retry after cooldown
 
