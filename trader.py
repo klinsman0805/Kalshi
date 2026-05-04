@@ -611,6 +611,7 @@ class MomentumTrader:
         self._position: Optional[dict] = None
         self._entry_attempted     = False
         self._entry_last_ts       = 0.0
+        self._pre_entry_logged    = False
         self._entry_window_logged = False
         self._tp_last_ts          = 0.0
         self._tp_window_logged    = False
@@ -631,6 +632,13 @@ class MomentumTrader:
         with self._lock:
             if self._current_ticker and self._current_ticker != snap.ticker:
                 self._reset_window()
+                mins = snap.secs_left // 60
+                secs = snap.secs_left % 60
+                self._on_log("🕐", (
+                    f"{self.asset} — new 15-min window detected  "
+                    f"({mins}m {secs}s remaining). "
+                    f"Waiting for the 13th-minute entry window."
+                ))
             self._current_ticker = snap.ticker
 
             now = time.time()
@@ -638,13 +646,24 @@ class MomentumTrader:
 
             # Phase 1: entry window
             if pos is None and not self._entry_attempted:
+                secs_to_window = max(0, MOMENTUM_ENTRY_START - elapsed)
+
+                # Heads-up ~2 minutes before the entry window opens
+                if elapsed < MOMENTUM_ENTRY_START and not self._pre_entry_logged:
+                    if secs_to_window <= 120:
+                        self._pre_entry_logged = True
+                        self._on_log("⏰", (
+                            f"{self.asset} — entry window opens in ~{secs_to_window}s. "
+                            f"Prices: YES ask {snap.yes_ask}¢  NO ask {snap.no_ask}¢"
+                        ))
+
                 if MOMENTUM_ENTRY_START <= elapsed <= MOMENTUM_ENTRY_END:
                     if not self._entry_window_logged:
                         self._entry_window_logged = True
-                        self._on_log("⏱", (
-                            f"MOMENTUM {self.asset} entry window open  "
-                            f"elapsed={elapsed}s  secs_left={snap.secs_left}  "
-                            f"YES_ask={snap.yes_ask}¢  NO_ask={snap.no_ask}¢"
+                        self._on_log("👀", (
+                            f"{self.asset} — now in the 13th-minute entry window. "
+                            f"Looking for YES ask or NO ask ≥ {MOMENTUM_ENTRY_THRESHOLD}¢. "
+                            f"Currently: YES ask {snap.yes_ask}¢  NO ask {snap.no_ask}¢"
                         ))
                     if now - self._entry_last_ts >= MOMENTUM_ENTRY_RETRY_COOLDOWN:
                         self._try_entry(snap)
@@ -658,10 +677,12 @@ class MomentumTrader:
                     self._tp_window_logged = True
                     side        = pos["side"]
                     current_bid = snap.yes_bid if side == "yes" else snap.no_bid
+                    tp_target   = max(MOMENTUM_TAKE_PROFIT, pos["entry_price"] + 1)
                     self._on_log("⏱", (
-                        f"MOMENTUM {self.asset} TP window open  "
-                        f"holding {side.upper()} entry={pos['entry_price']}¢  "
-                        f"bid={current_bid}¢  target={MOMENTUM_TAKE_PROFIT}¢  secs_left={snap.secs_left}"
+                        f"{self.asset} — last {snap.secs_left}s! "
+                        f"Holding {side.upper()} entered at {pos['entry_price']}¢. "
+                        f"Watching for bid ≥ {tp_target}¢ to take profit "
+                        f"(currently {current_bid}¢)."
                     ))
                 self._try_take_profit(snap)
 
@@ -684,9 +705,9 @@ class MomentumTrader:
                 p = self._position
                 if p["phase"] == "holding":
                     self._on_log("⏰", (
-                        f"MOMENTUM {self.asset} held to resolution: "
-                        f"{p['side'].upper()} {p['entry_price']}¢ × {p['count']} — "
-                        f"Kalshi settles at 100¢ (win) or 0¢ (loss)"
+                        f"{self.asset} — window closed with position open. "
+                        f"Held {p['side'].upper()} at {p['entry_price']}¢ × {p['count']} to resolution. "
+                        f"Kalshi will settle at 100¢ (win) or 0¢ (loss)."
                     ))
             self._reset_window()
 
@@ -697,6 +718,7 @@ class MomentumTrader:
         self._position            = None
         self._entry_attempted     = False
         self._entry_last_ts       = 0.0
+        self._pre_entry_logged    = False
         self._entry_window_logged = False
         self._tp_last_ts          = 0.0
         self._tp_window_logged    = False
@@ -718,7 +740,12 @@ class MomentumTrader:
         yes_ok = snap.yes_ask is not None and snap.yes_ask >= MOMENTUM_ENTRY_THRESHOLD
         no_ok  = snap.no_ask  is not None and snap.no_ask  >= MOMENTUM_ENTRY_THRESHOLD
         if not yes_ok and not no_ok:
-            return  # no qualifying side yet; will retry next tick within window
+            self._on_log("👀", (
+                f"{self.asset} — watching: YES ask {snap.yes_ask}¢  NO ask {snap.no_ask}¢ "
+                f"— need ≥ {MOMENTUM_ENTRY_THRESHOLD}¢, not there yet. "
+                f"{snap.secs_left}s left in window."
+            ))
+            return
 
         if yes_ok and no_ok:
             side = "yes" if snap.yes_ask >= snap.no_ask else "no"
@@ -793,8 +820,10 @@ class MomentumTrader:
                     "asset": self.asset, "ticker": snap.ticker,
                     "side": side, "price": price, "count": filled,
                 })
+                secs_to_tp = max(0, snap.secs_left - 60)
                 self._on_log("✅", (
-                    f"MOMENTUM ENTRY FILLED {self.asset} {side.upper()} {price}¢ × {filled}"
+                    f"{self.asset} — entered {side.upper()} at {price}¢ × {filled} contracts. "
+                    f"Holding position. TP window opens in ~{secs_to_tp}s."
                 ))
                 self._notify()
             else:
@@ -819,9 +848,8 @@ class MomentumTrader:
         if current_bid is None or current_bid < tp_target:
             if current_bid is not None:
                 self._on_log("⏳", (
-                    f"MOMENTUM TP {self.asset} {side.upper()}  "
-                    f"bid={current_bid}¢  need={tp_target}¢  "
-                    f"gap={tp_target - current_bid}¢  secs_left={snap.secs_left}"
+                    f"{self.asset} — bid now {current_bid}¢, need {tp_target}¢ to take profit "
+                    f"({tp_target - current_bid}¢ away). {snap.secs_left}s to resolution."
                 ))
             return  # target not reached yet; will retry after cooldown
 
@@ -831,8 +859,9 @@ class MomentumTrader:
         profit_est = (sell_price - pos["entry_price"]) * n / 100
 
         self._on_log("💰", (
-            f"MOMENTUM TP {self.asset} {side.upper()}  "
-            f"sell={sell_price}¢  entry={pos['entry_price']}¢  est_pnl=+${profit_est:.4f}"
+            f"{self.asset} — bid hit {sell_price}¢! Taking profit on "
+            f"{side.upper()} position (entered at {pos['entry_price']}¢). "
+            f"Est. profit: +${profit_est:.4f}"
         ))
 
         if DRY_RUN:
@@ -867,12 +896,12 @@ class MomentumTrader:
                     "entry_price": pos["entry_price"], "count": filled, "pnl": pnl,
                 })
                 self._on_log("✅", (
-                    f"MOMENTUM TP SOLD {self.asset} {side.upper()} {sell_price}¢ × {filled}  "
-                    f"pnl=+${pnl:.4f}"
+                    f"{self.asset} — took profit! Sold {side.upper()} at {sell_price}¢ × {filled} "
+                    f"(entry {pos['entry_price']}¢)  pnl=+${pnl:.4f}"
                 ))
                 self._notify()
             else:
-                self._on_log("⏸", f"MOMENTUM TP {self.asset} {side.upper()} {sell_price}¢ — no fill, retrying")
+                self._on_log("⏸", f"{self.asset} — TP order at {sell_price}¢ got no fill, will retry.")
         except Exception as e:
             self._on_log("✗", f"MOMENTUM TP error {self.asset}: {e}")
 
