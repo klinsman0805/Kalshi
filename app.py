@@ -102,6 +102,8 @@ def _add_log(icon: str, msg: str):
 
 # ── Bot callbacks ─────────────────────────────────────────────────────────────
 def _on_log(icon: str, msg: str):
+    if icon == "⚡" and BOT_STATE["momentum_mode"]:
+        return
     _add_log(icon, msg)
 
 def _on_momentum_update(asset: str, position):
