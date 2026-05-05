@@ -5,18 +5,14 @@ Run:  python -m pytest test_kalshi_bot.py -v
   or: python -m unittest test_kalshi_bot -v
 
 Tests cover:
-  1. Fee formula correctness
-  2. Orderbook mechanics (snapshot, delta apply, implied ask derivation)
-  3. Market snapshot + arb detection
-  4. Auth header generation (structure only)
-  5. Price parsing helpers
-  6. PositionBook tracking
-  7. DRY_RUN order execution path
-  8. BotEngine callbacks (no real WS)
-  9. ArbStats rolling statistics
- 10. Guardrails (cooldown, circuit breaker, concurrency, live order paths)
- 11. Live-readiness checklist (env, keys, fee constants, DRY_RUN flag)
- 12. MomentumTrader (entry, take-profit, reversal hedge, window reset, live orders)
+  1. Orderbook mechanics (snapshot, delta apply, implied ask derivation)
+  2. Market snapshot fields
+  3. Auth header generation (structure only)
+  4. Price parsing helpers
+  5. PositionBook tracking
+  6. BotEngine callbacks (no real WS)
+  7. Live-readiness checklist (env, keys, DRY_RUN flag)
+  8. MomentumTrader (entry, take-profit, reversal hedge, window reset, live orders)
 """
 
 import json
@@ -25,7 +21,6 @@ import sys
 import tempfile
 import time
 import unittest
-from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -58,82 +53,7 @@ engine.LOG_FILE    = _TMPDIR / "test_log.jsonl"
 
 
 # ==============================================================================
-# 1. Fee Formula Tests
-# ==============================================================================
-class TestFeeFormulas(unittest.TestCase):
-
-    def test_taker_fee_at_50(self):
-        """Max taker fee is 1.75c per contract at 50c."""
-        fee = engine.taker_fee_per_contract(50)
-        self.assertAlmostEqual(float(fee), 0.0175, places=6)
-
-    def test_maker_fee_at_50(self):
-        """Max maker fee is 0.4375c per contract at 50c."""
-        fee = engine.maker_fee_per_contract(50)
-        self.assertAlmostEqual(float(fee), 0.004375, places=6)
-
-    def test_taker_fee_at_10(self):
-        """Taker fee at 10c: 0.07 x 0.10 x 0.90 = 0.0063."""
-        fee = engine.taker_fee_per_contract(10)
-        self.assertAlmostEqual(float(fee), 0.0063, places=6)
-
-    def test_taker_fee_at_90(self):
-        """Taker fee at 90c == taker fee at 10c (symmetric)."""
-        fee_10 = engine.taker_fee_per_contract(10)
-        fee_90 = engine.taker_fee_per_contract(90)
-        self.assertAlmostEqual(float(fee_10), float(fee_90), places=6)
-
-    def test_maker_is_quarter_of_taker(self):
-        """Maker coef (0.0175) is exactly 1/4 of taker (0.07)."""
-        for p in [20, 35, 50, 65, 80]:
-            taker = engine.taker_fee_per_contract(p)
-            maker = engine.maker_fee_per_contract(p)
-            self.assertAlmostEqual(float(taker) / float(maker), 4.0, places=6,
-                                   msg=f"Ratio wrong at {p}c")
-
-    def test_total_taker_fee_rounds_up(self):
-        """Total fee is rounded UP to nearest cent."""
-        # 5 contracts at 50c: raw = 5 x 0.0175 = 0.0875 -> rounds up to 0.09
-        fee = engine.total_taker_fee(50, 5)
-        self.assertEqual(fee, Decimal("0.09"))
-
-    def test_total_maker_fee_rounds_up(self):
-        """Total maker fee rounds up."""
-        # 1 contract at 50c: raw = 0.004375 -> rounds up to 0.01
-        fee = engine.total_maker_fee(50, 1)
-        self.assertEqual(fee, Decimal("0.01"))
-
-    def test_arb_gap_no_profit_at_100(self):
-        """If yes_ask + no_ask = 100, taker gap is negative (fees eat profit)."""
-        gap = engine.arb_gap_cents(50, 50, 5, maker=False)
-        self.assertLess(float(gap), 0)
-
-    def test_arb_gap_profit_when_sum_low(self):
-        """If yes_ask + no_ask = 90, profit exists even after taker fees."""
-        gap = engine.arb_gap_cents(45, 45, 5, maker=False)
-        self.assertGreater(float(gap), 0)
-
-    def test_maker_gap_larger_than_taker_gap(self):
-        """Maker gap > taker gap since maker fees are lower."""
-        maker_gap = engine.arb_gap_cents(47, 47, 5, maker=True)
-        taker_gap = engine.arb_gap_cents(47, 47, 5, maker=False)
-        self.assertGreater(float(maker_gap), float(taker_gap))
-
-    def test_net_cost_components(self):
-        """net_cost_cents equals sum of YES + NO cost + both fees."""
-        yes_p, no_p, n = 48, 48, 5
-        cost = engine.net_cost_cents(yes_p, no_p, n, maker=True)
-        expected = (
-            Decimal(yes_p * n) / 100
-            + Decimal(no_p  * n) / 100
-            + engine.total_maker_fee(yes_p, n)
-            + engine.total_maker_fee(no_p,  n)
-        )
-        self.assertEqual(cost, expected)
-
-
-# ==============================================================================
-# 2. LocalBook Tests
+# 1. LocalBook Tests
 # ==============================================================================
 class TestLocalBook(unittest.TestCase):
 
@@ -178,11 +98,6 @@ class TestLocalBook(unittest.TestCase):
         book = self._make_book()
         self.assertEqual(book.best_no_ask(), 52)
 
-    def test_spread_cents(self):
-        """Spread = YES_ask - YES_bid = 48 - 48 = 0."""
-        book = self._make_book()
-        self.assertEqual(book.spread_cents(), 0)
-
     def test_mid(self):
         """Mid = (YES_bid + YES_ask) / 2 = (48 + 48) / 2 = 48."""
         book = self._make_book()
@@ -222,7 +137,6 @@ class TestLocalBook(unittest.TestCase):
         self.assertIsNone(book.best_no_bid())
         self.assertIsNone(book.best_yes_ask())
         self.assertIsNone(book.best_no_ask())
-        self.assertIsNone(book.spread_cents())
         self.assertIsNone(book.mid_cents())
 
     def test_max_levels_cap(self):
@@ -240,7 +154,7 @@ class TestLocalBook(unittest.TestCase):
 
 
 # ==============================================================================
-# 3. MarketSnapshot Tests
+# 2. MarketSnapshot Tests
 # ==============================================================================
 class TestMarketSnapshot(unittest.TestCase):
 
@@ -254,33 +168,33 @@ class TestMarketSnapshot(unittest.TestCase):
             book=book, window_ts=12345, secs_left=300
         )
 
-    def test_no_arb_when_sum_100(self):
-        """When yes_ask + no_ask = 100, fees make it unprofitable."""
-        snap = self._make_snap(yes_bids={50: 10}, no_bids={50: 10})
-        self.assertEqual(snap.raw_sum, 100)
-        self.assertFalse(snap.is_arb)
+    def test_implied_asks_computed(self):
+        """YES ask = 100 - best_NO_bid, NO ask = 100 - best_YES_bid."""
+        snap = self._make_snap(yes_bids={48: 10}, no_bids={52: 10})
+        self.assertEqual(snap.yes_ask, 48)   # 100 - 52
+        self.assertEqual(snap.no_ask,  52)   # 100 - 48
 
-    def test_arb_gap_calculated_when_sum_low(self):
-        """Gap is calculated (not None) when sum < 100."""
-        # YES bid=48, NO bid=55 -> YES ask=45, NO ask=52, sum=97
-        snap = self._make_snap(yes_bids={48: 10}, no_bids={55: 10})
-        self.assertEqual(snap.yes_ask, 45)
-        self.assertEqual(snap.no_ask,  52)
-        self.assertEqual(snap.raw_sum, 97)
-        self.assertIsNotNone(snap.taker_gap)
-        self.assertIsNotNone(snap.maker_gap)
+    def test_mid_is_average(self):
+        snap = self._make_snap(yes_bids={48: 10}, no_bids={52: 10})
+        self.assertIsNotNone(snap.mid)
 
     def test_to_dict_has_required_keys(self):
         snap = self._make_snap(yes_bids={48: 10}, no_bids={52: 10})
         d = snap.to_dict()
-        for key in ["asset", "ticker", "ts", "yes_bid", "no_bid",
-                    "yes_ask", "no_ask", "mid", "spread",
-                    "raw_sum", "gap_cents", "maker_gap", "taker_gap", "is_arb"]:
+        for key in ["asset", "ticker", "ts", "secs_left",
+                    "yes_bid", "no_bid", "yes_ask", "no_ask", "mid"]:
             self.assertIn(key, d, f"Missing key: {key}")
+
+    def test_none_when_book_empty(self):
+        snap = self._make_snap(yes_bids={}, no_bids={})
+        self.assertIsNone(snap.yes_bid)
+        self.assertIsNone(snap.no_bid)
+        self.assertIsNone(snap.yes_ask)
+        self.assertIsNone(snap.no_ask)
 
 
 # ==============================================================================
-# 4. Auth Header Tests
+# 3. Auth Header Tests
 # ==============================================================================
 class TestAuthHeaders(unittest.TestCase):
 
@@ -315,7 +229,7 @@ class TestAuthHeaders(unittest.TestCase):
 
 
 # ==============================================================================
-# 5. Price Parsing Tests
+# 4. Price Parsing Tests
 # ==============================================================================
 class TestPriceParsing(unittest.TestCase):
 
@@ -333,18 +247,9 @@ class TestPriceParsing(unittest.TestCase):
         self.assertEqual(engine._cents("0.0500"), 5)
         self.assertIsNone(engine._cents(None))
 
-    def test_market_ticker_format(self):
-        ts     = 1740000000
-        ticker = engine._market_ticker("BTC", ts)
-        self.assertEqual(ticker, f"KXBTC15M-{ts}")
-
-    def test_window_ts_is_multiple_of_900(self):
-        ts = engine._current_window_ts()
-        self.assertEqual(ts % 900, 0)
-
 
 # ==============================================================================
-# 6. PositionBook Tests  (fully isolated -- no shared global state)
+# 5. PositionBook Tests  (fully isolated -- no shared global state)
 # ==============================================================================
 class TestPositionBook(unittest.TestCase):
 
@@ -419,43 +324,7 @@ class TestPositionBook(unittest.TestCase):
 
 
 # ==============================================================================
-# 7. Dry-Run Order Execution Tests
-# ==============================================================================
-class TestDryRunExecution(unittest.TestCase):
-
-    def setUp(self):
-        # Clean trades file before each test
-        tf = _TMPDIR / "test_trades.jsonl"
-        if tf.exists():
-            tf.unlink()
-        trader.TRADES_FILE = tf
-
-    def _make_arb_snap(self) -> engine.MarketSnapshot:
-        """Snapshot with gap: YES bid=48, NO bid=55 -> YES ask=45, NO ask=52, sum=97."""
-        book = engine.LocalBook("KXBTCD-15MIN-12345")
-        book.yes_bids = {48: 50}
-        book.no_bids  = {55: 50}
-        book.ready    = True
-        return engine.MarketSnapshot(
-            asset="BTC", ticker="KXBTCD-15MIN-12345",
-            book=book, window_ts=12345, secs_left=300
-        )
-
-    def test_dry_run_arb_status(self):
-        snap   = self._make_arb_snap()
-        mkt    = {"ticker": "KXBTCD-15MIN-12345",
-                  "close_time": "2099-01-01T00:00:00Z",
-                  "window_ts": 12345}
-        result = trader.execute_arb(snap, mkt)
-        self.assertIsNotNone(result)
-        self.assertTrue(result["dry_run"])
-        self.assertIn(result["status"],
-                      ("dry_run", "skipped_no_gap", "skipped_no_price"))
-
-
-
-# ==============================================================================
-# 8. BotEngine Callback Tests (no real WS)
+# 6. BotEngine Callback Tests (no real WS)
 # ==============================================================================
 class TestBotEngineCallbacks(unittest.TestCase):
 
@@ -463,7 +332,6 @@ class TestBotEngineCallbacks(unittest.TestCase):
         bot = engine.BotEngine(
             on_log    = lambda i, m: None,
             on_prices = lambda m, s: None,
-            on_arb    = lambda snap: None,
             on_status = lambda s: None,
         )
         self.assertIsNotNone(bot)
@@ -475,7 +343,7 @@ class TestBotEngineCallbacks(unittest.TestCase):
     def test_compute_and_push_sets_snapshot(self):
         bot = engine.BotEngine(
             on_log=lambda i, m: None, on_prices=lambda m, s: None,
-            on_arb=lambda s: None,    on_status=lambda s: None,
+            on_status=lambda s: None,
         )
         ticker = "KXBTCD-15MIN-12345"
         book   = engine.LocalBook(ticker)
@@ -497,19 +365,19 @@ class TestBotEngineCallbacks(unittest.TestCase):
         # YES ask = 100 - 55 = 45, NO ask = 100 - 55 = 45
         self.assertEqual(snap.yes_ask, 45)
         self.assertEqual(snap.no_ask,  45)
-        self.assertEqual(snap.raw_sum, 90)
 
-    def test_arb_dedup_no_double_fire(self):
-        """Same (yes_ask, no_ask) pair fires on_arb only once."""
-        arbs = []
-        bot  = engine.BotEngine(
-            on_log=lambda i, m: None, on_prices=lambda m, s: None,
-            on_arb=lambda s: arbs.append(s), on_status=lambda s: None,
+    def test_on_prices_fires_on_price_change(self):
+        """on_prices callback fires when yes_ask or no_ask changes."""
+        events = []
+        bot = engine.BotEngine(
+            on_log=lambda i, m: None,
+            on_prices=lambda m, s: events.append(s),
+            on_status=lambda s: None,
         )
         ticker = "KXBTCD-15MIN-12345"
         book   = engine.LocalBook(ticker)
-        book.yes_bids = {55: 100}
-        book.no_bids  = {55: 100}
+        book.yes_bids = {60: 100}
+        book.no_bids  = {60: 100}
         book.ready    = True
         bot.markets["BTC"] = {
             "asset": "BTC", "ticker": ticker, "window_ts": 12345,
@@ -519,33 +387,14 @@ class TestBotEngineCallbacks(unittest.TestCase):
         bot._ticker_map[ticker] = "BTC"
 
         bot._compute_and_push("BTC")
-        bot._compute_and_push("BTC")  # same prices -- should NOT fire again
+        bot._compute_and_push("BTC")   # same prices — should NOT fire again
 
-        self.assertLessEqual(len(arbs), 1)
+        self.assertEqual(len(events), 1)
 
 
 # ==============================================================================
-# Shared helper — arb-quality snapshot used by multiple test classes
+# Shared helper for MomentumTrader tests
 # ==============================================================================
-def _make_arb_snap() -> engine.MarketSnapshot:
-    """
-    YES bid=55, NO bid=55  →  YES ask=45, NO ask=45, raw_sum=90.
-    taker_gap ≈ +6.4c per pair — definitively profitable after fees.
-    """
-    book = engine.LocalBook("KXBTCD-15MIN-12345")
-    book.yes_bids = {55: 50}
-    book.no_bids  = {55: 50}
-    book.ready    = True
-    return engine.MarketSnapshot(
-        asset="BTC", ticker="KXBTCD-15MIN-12345",
-        book=book, window_ts=12345, secs_left=300,
-    )
-
-_ARB_MKT = {"ticker": "KXBTCD-15MIN-12345",
-            "close_time": "2099-01-01T00:00:00Z",
-            "window_ts": 12345}
-
-
 def _make_momentum_snap(yes_bid=None, no_bid=None, secs_left=100,
                         ticker="KXBTCD-15MIN-12345",
                         override_no_ask=None, override_yes_ask=None
@@ -572,333 +421,7 @@ def _make_momentum_snap(yes_bid=None, no_bid=None, secs_left=100,
 
 
 # ==============================================================================
-# 9. ArbStats Tests
-# ==============================================================================
-class TestArbStats(unittest.TestCase):
-
-    def test_initial_state_all_zeros(self):
-        s = engine.ArbStats("BTC")
-        self.assertEqual(s.raw_gap_count, 0)
-        self.assertEqual(s.profitable_count, 0)
-        self.assertEqual(s.avg_gap, 0.0)
-        self.assertEqual(s.max_gap, 0.0)
-        self.assertIsNone(s.last_gap)
-        self.assertIsNone(s.last_ts)
-
-    def test_record_profitable_gap(self):
-        s = engine.ArbStats("BTC")
-        s.record(raw_gap=2.5, taker_gap=1.0)
-        self.assertEqual(s.raw_gap_count, 1)
-        self.assertEqual(s.profitable_count, 1)
-        self.assertAlmostEqual(s.avg_gap, 2.5)
-        self.assertEqual(s.max_gap, 2.5)
-        self.assertEqual(s.last_gap, 2.5)
-        self.assertIsNotNone(s.last_ts)
-
-    def test_record_non_profitable_gap(self):
-        """raw_gap exists (combined < 100) but taker_gap negative (fees eat profit)."""
-        s = engine.ArbStats("ETH")
-        s.record(raw_gap=0.5, taker_gap=-0.1)
-        self.assertEqual(s.raw_gap_count, 1)
-        self.assertEqual(s.profitable_count, 0)
-
-    def test_avg_gap_over_multiple_records(self):
-        s = engine.ArbStats("SOL")
-        s.record(2.0, 1.0)
-        s.record(4.0, 2.0)
-        self.assertAlmostEqual(s.avg_gap, 3.0)
-
-    def test_max_gap_tracks_highest(self):
-        s = engine.ArbStats("BTC")
-        s.record(1.0, 0.5)
-        s.record(5.0, 3.0)
-        s.record(3.0, 1.0)
-        self.assertEqual(s.max_gap, 5.0)
-
-    def test_capture_rate_100pct(self):
-        s = engine.ArbStats("BTC")
-        s.record(2.0, 1.0)
-        s.record(3.0, 0.5)
-        self.assertAlmostEqual(s.capture_rate, 100.0)
-
-    def test_capture_rate_50pct(self):
-        s = engine.ArbStats("BTC")
-        s.record(2.0, 1.0)    # profitable
-        s.record(0.5, -0.1)   # not profitable
-        self.assertAlmostEqual(s.capture_rate, 50.0)
-
-    def test_capture_rate_zero_when_no_records(self):
-        s = engine.ArbStats("BTC")
-        self.assertEqual(s.capture_rate, 0.0)
-
-    def test_gaps_per_hour_positive(self):
-        s = engine.ArbStats("BTC")
-        s.record(1.0, 0.5)
-        self.assertGreater(s.gaps_per_hour, 0.0)
-
-    def test_to_dict_has_all_keys(self):
-        s = engine.ArbStats("ETH")
-        d = s.to_dict()
-        for key in ["asset", "raw_gap_count", "profitable_count",
-                    "avg_gap", "max_gap", "last_gap", "last_ts",
-                    "gaps_per_hour", "capture_rate"]:
-            self.assertIn(key, d, f"Missing key: {key}")
-
-    def test_bot_engine_exposes_arb_stats(self):
-        """BotEngine.get_arb_stats() returns a dict keyed by asset."""
-        bot = engine.BotEngine(
-            on_log=lambda i, m: None, on_prices=lambda m, s: None,
-            on_arb=lambda s: None,    on_status=lambda s: None,
-        )
-        stats = bot.get_arb_stats()
-        self.assertIsInstance(stats, dict)
-        for asset in engine.ASSETS:
-            self.assertIn(asset, stats)
-            self.assertIn("raw_gap_count", stats[asset])
-
-
-# ==============================================================================
-# 10. Guardrail Tests
-# ==============================================================================
-def _reset_guardrails():
-    """Helper: wipe all guardrail state between tests."""
-    import threading
-    trader._halt_trading.clear()
-    trader._asset_cooldowns.clear()
-    trader._session_start_pnl = None
-    # Rebuild semaphore to ensure it is at full count
-    trader._ARB_LOCK = threading.Semaphore(trader.MAX_CONCURRENT_ORDERS)
-
-
-class TestGuardrails(unittest.TestCase):
-
-    def setUp(self):
-        _reset_guardrails()
-        trader.DRY_RUN = True      # keep tests safe
-        trader.TRADES_FILE = _TMPDIR / "test_trades.jsonl"
-        trader.POSITIONS._data["positions"].pop(_ARB_MKT["ticker"], None)
-
-    def tearDown(self):
-        _reset_guardrails()
-        trader.POSITIONS._data["positions"].pop(_ARB_MKT["ticker"], None)
-
-    # ── cooldown ────────────────────────────────────────────────────────────────
-
-    def test_check_cooldown_allows_fresh_asset(self):
-        self.assertIsNone(trader._check_cooldown("BTC"))
-
-    def test_arm_then_check_blocks(self):
-        trader._arm_cooldown("BTC")
-        self.assertEqual(trader._check_cooldown("BTC"), "cooldown")
-
-    def test_cooldown_expires(self):
-        """Once the cooldown window passes, execution is re-allowed."""
-        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
-        self.assertIsNone(trader._check_cooldown("BTC"))
-
-    def test_cooldown_is_per_asset(self):
-        """Cooldown on BTC does NOT affect ETH."""
-        trader._arm_cooldown("BTC")
-        self.assertIsNone(trader._check_cooldown("ETH"))
-
-    # ── circuit breaker ─────────────────────────────────────────────────────────
-
-    def test_halted_flag_blocks_all_assets(self):
-        trader._halt_trading.set()
-        for asset in ["BTC", "ETH", "SOL"]:
-            self.assertEqual(trader._check_cooldown(asset), "circuit_breaker")
-
-    def test_reset_halt_clears_flag(self):
-        trader._halt_trading.set()
-        trader.reset_halt()
-        self.assertFalse(trader._halt_trading.is_set())
-        self.assertIsNone(trader._check_cooldown("BTC"))
-
-    def test_reset_halt_also_clears_pnl_baseline(self):
-        trader._session_start_pnl = 5.0
-        trader.reset_halt()
-        self.assertIsNone(trader._session_start_pnl)
-
-    # ── guardrail status ────────────────────────────────────────────────────────
-
-    def test_get_guardrail_status_keys(self):
-        status = trader.get_guardrail_status()
-        for key in ["halted", "cooldowns", "cooldown_secs", "max_concurrent", "max_daily_loss"]:
-            self.assertIn(key, status)
-
-    def test_get_guardrail_status_not_halted_by_default(self):
-        self.assertFalse(trader.get_guardrail_status()["halted"])
-
-    def test_get_guardrail_status_shows_active_cooldown(self):
-        trader._arm_cooldown("SOL")
-        status = trader.get_guardrail_status()
-        self.assertIn("SOL", status["cooldowns"])
-        self.assertGreater(status["cooldowns"]["SOL"], 0)
-
-    def test_get_guardrail_status_cooldown_absent_after_expiry(self):
-        trader._asset_cooldowns["ETH"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
-        status = trader.get_guardrail_status()
-        self.assertNotIn("ETH", status["cooldowns"])
-
-    # ── execute_arb integration ──────────────────────────────────────────────────
-
-    def test_execute_arb_skipped_when_on_cooldown(self):
-        trader._arm_cooldown("BTC")
-        result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
-        self.assertEqual(result["status"], "skipped_cooldown")
-
-    def test_execute_arb_skipped_when_halted(self):
-        trader._halt_trading.set()
-        result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
-        self.assertEqual(result["status"], "skipped_circuit_breaker")
-
-    def test_execute_arb_dry_run_after_cooldown_expires(self):
-        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
-        result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
-        self.assertEqual(result["status"], "dry_run")
-
-    def test_execute_arb_dry_run_arms_cooldown(self):
-        """Successful dry_run execution arms per-asset cooldown."""
-        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
-        trader.execute_arb(_make_arb_snap(), _ARB_MKT)
-        self.assertIn("BTC", trader._asset_cooldowns)
-        # Second call is now blocked
-        result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
-        self.assertEqual(result["status"], "skipped_cooldown")
-
-    def test_execute_arb_skipped_when_semaphore_full(self):
-        """When MAX_CONCURRENT_ORDERS slots are taken, further calls are skipped."""
-        acquired = trader._ARB_LOCK.acquire(blocking=False)
-        self.assertTrue(acquired, "Semaphore should be free at test start")
-        try:
-            result = trader.execute_arb(_make_arb_snap(), _ARB_MKT)
-            self.assertEqual(result["status"], "skipped_max_concurrent")
-        finally:
-            trader._ARB_LOCK.release()
-
-    def test_semaphore_released_after_dry_run(self):
-        """Semaphore must be back to full count after a completed dry_run."""
-        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
-        trader.execute_arb(_make_arb_snap(), _ARB_MKT)
-        # Semaphore should be acquirable again (try non-blocking)
-        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
-        acquired = trader._ARB_LOCK.acquire(blocking=False)
-        self.assertTrue(acquired, "Semaphore not released after execute_arb returned")
-        trader._ARB_LOCK.release()
-
-    def test_execute_arb_skipped_near_expiry(self):
-        """Snap with secs_left < MIN_SECS_LEFT is skipped."""
-        snap = _make_arb_snap()
-        snap.secs_left = trader.MIN_SECS_LEFT - 1
-        result = trader.execute_arb(snap, _ARB_MKT)
-        self.assertEqual(result["status"], "skipped_near_expiry")
-
-    def test_execute_arb_skipped_when_no_depth(self):
-        """Snap with zero depth on either side is skipped before placing any order."""
-        snap = _make_arb_snap()
-        snap.yes_ask_depth = 0   # simulate empty book on YES side
-        result = trader.execute_arb(snap, _ARB_MKT)
-        self.assertEqual(result["status"], "skipped_no_depth")
-
-    def test_execute_arb_not_called_for_illiquid_snap(self):
-        """Snaps outside liquid price range have is_arb=False, so on_arb never fires."""
-        book = engine.LocalBook("KXBTCD-15MIN-TEST")
-        # YES bid=5 → YES ask=95 (illiquid high), NO bid=95 → NO ask=5 (illiquid low)
-        book.yes_bids = {5: 10}
-        book.no_bids  = {95: 10}
-        book.ready    = True
-        snap = engine.MarketSnapshot("BTC", "KXBTCD-15MIN-TEST", book, 0, 300)
-        self.assertFalse(snap.is_arb,
-                         "is_arb must be False when prices are outside liquid range")
-
-    def _run_live_arb(self, yes_response, no_response,
-                      unwind_yes_response=None, unwind_no_response=None):
-        """
-        Helper: temporarily disable DRY_RUN and mock _post_order to exercise
-        the live-order path of execute_arb (concurrent YES+NO placement).
-
-        Dispatches by body['side'] + body['action'] so thread order doesn't matter.
-        """
-        import unittest.mock as mock
-        trader._asset_cooldowns["BTC"] = time.time() - trader.ARB_COOLDOWN_SECS - 1
-
-        def fake_post(body):
-            side   = body.get("side")
-            action = body.get("action", "buy")
-            if action == "sell":
-                resp = unwind_yes_response if side == "yes" else unwind_no_response
-            elif side == "yes":
-                resp = yes_response
-            else:
-                resp = no_response
-            if isinstance(resp, Exception):
-                raise resp
-            return resp if resp is not None else {"order": {}}
-
-        ticker = _ARB_MKT["ticker"]
-        trader.POSITIONS._data["positions"].pop(ticker, None)
-
-        orig_dry = trader.DRY_RUN
-        try:
-            trader.DRY_RUN = False
-            with mock.patch.object(trader, "_post_order", side_effect=fake_post):
-                with mock.patch.object(trader, "_log_trade"):
-                    return trader.execute_arb(_make_arb_snap(), _ARB_MKT)
-        finally:
-            trader.DRY_RUN = orig_dry
-            trader.POSITIONS._data["positions"].pop(ticker, None)
-
-    def test_live_arb_both_legs_filled(self):
-        """Both YES and NO IOC fill → status 'filled'."""
-        yes_resp = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "5.00"}}
-        no_resp  = {"order": {"order_id": "n1", "status": "executed", "fill_count_fp": "5.00"}}
-        result = self._run_live_arb(yes_resp, no_resp)
-        self.assertEqual(result["status"], "filled")
-        self.assertEqual(result["n"], 5)
-
-    def test_live_arb_both_legs_miss_returns_error(self):
-        """Both YES and NO IOC canceled (book moved) → status 'error', no unhedged."""
-        yes_resp = {"order": {"order_id": "y1", "status": "canceled", "fill_count_fp": "0"}}
-        no_resp  = {"order": {"order_id": "n1", "status": "canceled", "fill_count_fp": "0"}}
-        result = self._run_live_arb(yes_resp, no_resp)
-        self.assertEqual(result["status"], "error")
-
-    def test_live_arb_yes_fills_no_misses_unwind_ok(self):
-        """YES fills, NO misses → unwind YES succeeds → status 'unwound_partial'."""
-        yes_resp    = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "5.00"}}
-        no_resp     = {"order": {"order_id": "n1", "status": "canceled",  "fill_count_fp": "0"}}
-        unwind_resp = {"order": {"order_id": "u1", "status": "executed", "fill_count_fp": "5.00"}}
-        result = self._run_live_arb(yes_resp, no_resp, unwind_yes_response=unwind_resp)
-        self.assertEqual(result["status"], "unwound_partial")
-
-    def test_live_arb_yes_fills_no_misses_unwind_fails(self):
-        """YES fills, NO misses, unwind also fails → status 'partial_unhedged'."""
-        yes_resp    = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "5.00"}}
-        no_resp     = {"order": {"order_id": "n1", "status": "canceled",  "fill_count_fp": "0"}}
-        unwind_resp = {"order": {"order_id": "u1", "status": "canceled",  "fill_count_fp": "0"}}
-        result = self._run_live_arb(yes_resp, no_resp, unwind_yes_response=unwind_resp)
-        self.assertEqual(result["status"], "partial_unhedged")
-
-    def test_live_arb_yes_fills_no_misses_unwind_exception(self):
-        """YES fills, NO misses, unwind raises → status 'partial_unhedged'."""
-        yes_resp = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "5.00"}}
-        no_resp  = {"order": {"order_id": "n1", "status": "canceled",  "fill_count_fp": "0"}}
-        result   = self._run_live_arb(yes_resp, no_resp,
-                                      unwind_yes_response=Exception("timeout"))
-        self.assertEqual(result["status"], "partial_unhedged")
-
-    def test_live_arb_partial_fills_hedged_minimum(self):
-        """YES=3, NO=5 → hedged=3, NO excess=2 unwound → status 'filled' with n=3."""
-        yes_resp    = {"order": {"order_id": "y1", "status": "executed", "fill_count_fp": "3.00"}}
-        no_resp     = {"order": {"order_id": "n1", "status": "executed", "fill_count_fp": "5.00"}}
-        unwind_resp = {"order": {"order_id": "u1", "status": "executed", "fill_count_fp": "2.00"}}
-        result = self._run_live_arb(yes_resp, no_resp, unwind_no_response=unwind_resp)
-        self.assertEqual(result["status"], "filled")
-        self.assertEqual(result["n"], 3)
-
-
-# ==============================================================================
-# 11. Live-Readiness Checklist
+# 7. Live-Readiness Checklist
 # ==============================================================================
 class TestLiveReadiness(unittest.TestCase):
     """
@@ -959,29 +482,23 @@ class TestLiveReadiness(unittest.TestCase):
             engine.KALSHI_KEY_FILE = original_key_file
             engine._private_key    = None
 
-    def test_fee_formula_vs_known_values(self):
-        """Regression: verify fee constants match the official Kalshi fee schedule."""
-        # At 50c: taker = 0.07 * 0.50 * 0.50 = 0.0175 per contract
-        self.assertAlmostEqual(float(engine.taker_fee_per_contract(50)), 0.0175, places=6)
-        # At 50c: maker = 0.0175 * 0.50 * 0.50 = 0.004375 per contract
-        self.assertAlmostEqual(float(engine.maker_fee_per_contract(50)), 0.004375, places=6)
-
-    def test_guardrail_defaults_are_sensible(self):
-        """Config defaults protect against runaway live trading."""
-        self.assertGreater(trader.ARB_COOLDOWN_SECS, 0,
-                           "ARB_COOLDOWN_SECS must be > 0")
-        self.assertGreaterEqual(trader.MAX_CONCURRENT_ORDERS, 1)
-        self.assertGreater(trader.MAX_DAILY_LOSS_USD, 0,
-                           "MAX_DAILY_LOSS_USD must be > 0 to act as a stop")
-
     def test_dry_run_is_on_in_test_environment(self):
         """Confirm DRY_RUN is forced true in the test suite."""
         self.assertTrue(engine.DRY_RUN,
                         "DRY_RUN is False during test run — this is unsafe")
 
+    def test_momentum_config_defaults_are_sensible(self):
+        """Momentum thresholds must satisfy entry_threshold < take_profit < 100."""
+        self.assertGreater(trader.MOMENTUM_ENTRY_THRESHOLD, 0)
+        self.assertLess(trader.MOMENTUM_ENTRY_THRESHOLD, trader.MOMENTUM_TAKE_PROFIT)
+        self.assertLess(trader.MOMENTUM_TAKE_PROFIT, 100)
+        self.assertLess(trader.MOMENTUM_ENTRY_THRESHOLD, trader.MOMENTUM_ENTRY_MAX)
+        self.assertGreater(trader.MOMENTUM_ENTRY_START, 0)
+        self.assertGreater(trader.MOMENTUM_ENTRY_END, trader.MOMENTUM_ENTRY_START)
+
 
 # ==============================================================================
-# 12. MomentumTrader Tests
+# 8. MomentumTrader Tests
 # ==============================================================================
 
 # ── Entry phase ───────────────────────────────────────────────────────────────
@@ -1354,7 +871,6 @@ class TestMomentumTraderLiveOrders(unittest.TestCase):
         self._orig_dry = trader.DRY_RUN
 
     def tearDown(self):
-        trader.DRY_RUN = trader.DRY_RUN   # no-op, but explicit
         trader.DRY_RUN = self._orig_dry
         trader.POSITIONS._data["positions"].pop("KXBTCD-15MIN-12345", None)
 
