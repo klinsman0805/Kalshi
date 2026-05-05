@@ -662,7 +662,7 @@ function renderMomCard(asset) {
     if (elapsed != null) {
       if (elapsed < 780) {
         const rem = 780 - elapsed;
-        statusTxt = `entry in ${Math.floor(rem/60)}m${rem%60}s`;
+        statusTxt = `entry in ${Math.floor(rem/60)}m${Math.floor(rem%60)}s`;
       } else if (elapsed <= 840) {
         statusTxt = 'watching 14th min…';
       } else {
@@ -741,7 +741,7 @@ function renderMsCard(asset) {
   let phaseNote = '';
   if (!pos && elapsed != null && elapsed < 780) {
     const rem = 780 - elapsed;
-    phaseNote = `entry in ${Math.floor(rem/60)}m ${rem%60}s`;
+    phaseNote = `entry in ${Math.floor(rem/60)}m ${Math.floor(rem%60)}s`;
   }
 
   let posHtml = '';
