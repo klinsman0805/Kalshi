@@ -1046,4 +1046,6 @@ if __name__ == "__main__":
     print(f"  Dashboard → http://localhost:5001")
     print(f"  Mode: {'DEMO' if BOT_STATE['demo'] else 'LIVE'}  |  {'DRY RUN' if BOT_STATE['dry_run'] else 'REAL ORDERS'}\n")
 
+    _start_bot()
+
     app.run(host="0.0.0.0", port=5001, debug=False, threaded=True, use_reloader=False)
