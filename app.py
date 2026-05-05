@@ -404,7 +404,7 @@ def api_trades():
         pass
     return jsonify({"trades": []})
 
-# ── Dashboard HTML ────────────────────────────────────────────────────────────
+# ── Dashboard HTML ───────────────────────────────────────────────────────────
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
