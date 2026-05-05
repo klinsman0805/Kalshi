@@ -52,6 +52,8 @@ MOMENTUM_TP_COOLDOWN          = float(os.getenv("MOMENTUM_TP_COOLDOWN",        "
 MOMENTUM_HEDGE_COOLDOWN       = float(os.getenv("MOMENTUM_HEDGE_COOLDOWN",     "3.0"))
 MOMENTUM_ENTRY_RETRY_MAX      = int(os.getenv("MOMENTUM_ENTRY_RETRY_MAX",      "90"))
 MOMENTUM_ENTRY_RETRY_COOLDOWN = float(os.getenv("MOMENTUM_ENTRY_RETRY_COOLDOWN","2.0"))
+MOMENTUM_STOP_LOSS            = int(os.getenv("MOMENTUM_STOP_LOSS",            "60"))
+MOMENTUM_STOP_LOSS_COOLDOWN   = float(os.getenv("MOMENTUM_STOP_LOSS_COOLDOWN", "3.0"))
 
 # ── Position book ─────────────────────────────────────────────────────────────
 class PositionBook:
@@ -167,6 +169,8 @@ class MomentumTrader:
         self._tp_window_logged    = False
         self._hedge_last_ts       = 0.0
         self._hedge_attempted     = False
+        self._sl_last_ts          = 0.0
+        self._sl_attempted        = False
         self._current_ticker: Optional[str] = None
 
     # ── Public ────────────────────────────────────────────────────────────────
@@ -225,6 +229,13 @@ class MomentumTrader:
                     ))
                 self._try_take_profit(snap)
 
+            # Stop loss: exit + hedge when bid drops to MOMENTUM_STOP_LOSS (any secs_left)
+            pos = self._position
+            if (pos is not None and pos["phase"] == "holding"
+                    and not self._sl_attempted
+                    and now - self._sl_last_ts >= MOMENTUM_STOP_LOSS_COOLDOWN):
+                self._try_stop_loss(snap)
+
             # Phase 3: reversal hedge
             pos = self._position
             if (pos is not None and pos["phase"] == "holding"
@@ -261,6 +272,8 @@ class MomentumTrader:
         self._tp_window_logged    = False
         self._hedge_last_ts       = 0.0
         self._hedge_attempted     = False
+        self._sl_last_ts          = 0.0
+        self._sl_attempted        = False
 
     def _notify(self):
         self._on_update(self.asset, dict(self._position) if self._position else None)
@@ -315,9 +328,11 @@ class MomentumTrader:
                 "entry_price": price,
                 "count":       n,
                 "entry_ts":    datetime.now(timezone.utc).isoformat(),
-                "phase":       "holding",
-                "hedge_price": None,
-                "hedge_count": None,
+                "phase":          "holding",
+                "hedge_price":    None,
+                "hedge_count":    None,
+                "sl_exit_price":  None,
+                "sl_hedge_price": None,
             }
             self._on_log("📋", f"[DRY RUN] MOMENTUM {self.asset} {side.upper()} {price}¢ × {n}")
             self._notify()
@@ -533,3 +548,123 @@ class MomentumTrader:
         except Exception as e:
             self._hedge_attempted = False
             self._on_log("✗", f"MOMENTUM HEDGE error {self.asset}: {e}")
+
+    def _try_stop_loss(self, snap):
+        """
+        Exit when entry-side bid drops to MOMENTUM_STOP_LOSS (60¢).
+        Sells the entry side IOC at current bid, then immediately buys the opposite
+        side at the implied ask (100 - bid = 40¢) to recover via reversal.
+        The sell is mandatory; the hedge buy is best-effort (one attempt, no retry).
+        """
+        self._sl_last_ts = time.time()
+        pos         = self._position
+        side        = pos["side"]
+        entry_price = pos["entry_price"]
+
+        current_bid = snap.yes_bid if side == "yes" else snap.no_bid
+        if current_bid is None or current_bid > MOMENTUM_STOP_LOSS:
+            return
+
+        n          = pos["count"]
+        sl_price   = current_bid
+        loss_est   = (sl_price - entry_price) * n / 100
+        hedge_side = "no"  if side == "yes" else "yes"
+        hedge_ask  = 100 - current_bid   # implied opposite ask (40¢ when bid = 60¢)
+
+        self._on_log("🔴", (
+            f"STOP LOSS {self.asset} {side.upper()} bid hit {sl_price}¢  "
+            f"(entry={entry_price}¢  est. loss=~${abs(loss_est):.4f})  "
+            f"Exiting and buying {hedge_side.upper()} at {hedge_ask}¢."
+        ))
+
+        if DRY_RUN:
+            self._sl_attempted = True
+            POSITIONS.realise_pnl(loss_est)
+            self._position["phase"]         = "stop_loss"
+            self._position["sl_exit_price"] = sl_price
+            self._position["sl_hedge_price"] = hedge_ask
+            self._on_log("📋", (
+                f"[DRY RUN] STOP LOSS {self.asset} sell {side.upper()} {sl_price}¢ × {n}  "
+                f"pnl=${loss_est:.4f}  hedge buy {hedge_side.upper()} {hedge_ask}¢ × {n}"
+            ))
+            self._notify()
+            return
+
+        # Step 1: sell the entry side (stop loss exit)
+        cid_sl    = _make_client_id(self.asset, f"mom-sl-{side}")
+        body_sell = {
+            "ticker":          snap.ticker,
+            "side":            side,
+            "action":          "sell",
+            "count":           n,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid_sl,
+        }
+        body_sell["yes_price" if side == "yes" else "no_price"] = sl_price
+
+        try:
+            resp   = _post_order(body_sell)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                self._sl_attempted = True
+                pnl = (sl_price - entry_price) * filled / 100
+                POSITIONS.realise_pnl(pnl)
+                self._position["phase"]         = "stop_loss"
+                self._position["sl_exit_price"] = sl_price
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_stop_loss",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "side": side, "sl_price": sl_price,
+                    "entry_price": entry_price, "count": filled, "pnl": pnl,
+                })
+                self._on_log("🔴", (
+                    f"STOP LOSS EXECUTED {self.asset} sold {side.upper()} at {sl_price}¢ × {filled}  "
+                    f"(entry={entry_price}¢)  pnl=${pnl:.4f}"
+                ))
+                self._notify()
+                # Step 2: buy the opposite side to recover (best-effort)
+                self._buy_stop_loss_hedge(snap, hedge_side, hedge_ask, filled)
+            else:
+                self._on_log("⏸", (
+                    f"STOP LOSS {self.asset} sell {side.upper()} at {sl_price}¢ — no fill, retrying."
+                ))
+        except Exception as e:
+            self._on_log("✗", f"STOP LOSS error {self.asset}: {e}")
+
+    def _buy_stop_loss_hedge(self, snap, hedge_side: str, hedge_ask: int, count: int):
+        """Buy the opposite side after a stop loss exit. Single attempt, no retry."""
+        cid  = _make_client_id(self.asset, f"mom-sl-hedge-{hedge_side}")
+        body = {
+            "ticker":          snap.ticker,
+            "side":            hedge_side,
+            "action":          "buy",
+            "count":           count,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid,
+        }
+        body["yes_price" if hedge_side == "yes" else "no_price"] = hedge_ask
+
+        try:
+            resp   = _post_order(body)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                POSITIONS.record_fill(snap.ticker, hedge_side, hedge_ask, filled, cid)
+                self._position["sl_hedge_price"] = hedge_ask
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_sl_hedge",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "hedge_side": hedge_side, "hedge_price": hedge_ask, "count": filled,
+                })
+                self._on_log("🛡", (
+                    f"STOP LOSS HEDGE FILLED {self.asset} bought {hedge_side.upper()} "
+                    f"at {hedge_ask}¢ × {filled}"
+                ))
+                self._notify()
+            else:
+                self._on_log("⏸", (
+                    f"STOP LOSS HEDGE {self.asset} {hedge_side.upper()} {hedge_ask}¢ — no fill"
+                ))
+        except Exception as e:
+            self._on_log("✗", f"STOP LOSS HEDGE error {self.asset}: {e}")
