@@ -57,6 +57,7 @@ MOMENTUM_STOP_LOSS_COOLDOWN   = float(os.getenv("MOMENTUM_STOP_LOSS_COOLDOWN", "
 MOMENTUM_INSURANCE_THRESHOLD  = int(os.getenv("MOMENTUM_INSURANCE_THRESHOLD",   "5"))
 MOMENTUM_INSURANCE_COUNT      = int(os.getenv("MOMENTUM_INSURANCE_COUNT",        "3"))
 MOMENTUM_INSURANCE_COOLDOWN   = float(os.getenv("MOMENTUM_INSURANCE_COOLDOWN",  "3.0"))
+MOMENTUM_SL_HEDGE_SLIPPAGE    = int(os.getenv("MOMENTUM_SL_HEDGE_SLIPPAGE",      "5"))
 
 # ── Position book ─────────────────────────────────────────────────────────────
 class PositionBook:
@@ -583,7 +584,8 @@ class MomentumTrader:
         sl_price   = current_bid
         loss_est   = (sl_price - entry_price) * n / 100
         hedge_side = "no"  if side == "yes" else "yes"
-        hedge_ask  = 100 - current_bid   # implied opposite ask (40¢ when bid = 60¢)
+        # Add slippage buffer so the IOC fills even if market moves between SL sell and hedge buy
+        hedge_ask  = min(99, 100 - current_bid + MOMENTUM_SL_HEDGE_SLIPPAGE)
 
         self._on_log("🔴", (
             f"STOP LOSS {self.asset} {side.upper()} bid hit {sl_price}¢  "
