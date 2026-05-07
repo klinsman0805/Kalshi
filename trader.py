@@ -248,10 +248,11 @@ class MomentumTrader:
                     and now - self._entry_last_ts >= MOMENTUM_SL_MIN_AGE):
                 self._try_stop_loss(snap)
 
-            # Warning hedge: buy cheap opposite side when bid drops to danger zone (above SL)
+            # Warning hedge: only in last 30s — avoids burning money on temporary dips
             pos = self._position
             if (pos is not None and pos["phase"] == "holding"
                     and not self._warn_attempted
+                    and snap.secs_left <= 30
                     and now - self._warn_last_ts >= MOMENTUM_WARN_COOLDOWN
                     and now - self._entry_last_ts >= MOMENTUM_SL_MIN_AGE):
                 self._try_warn_hedge(snap)
