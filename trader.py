@@ -24,6 +24,12 @@ from pathlib import Path
 from typing import Optional
 
 try:
+    import anthropic as _anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -61,6 +67,9 @@ MOMENTUM_WARN_THRESHOLD       = int(os.getenv("MOMENTUM_WARN_THRESHOLD",        
 MOMENTUM_WARN_COUNT           = int(os.getenv("MOMENTUM_WARN_COUNT",             "5"))
 MOMENTUM_WARN_COOLDOWN        = float(os.getenv("MOMENTUM_WARN_COOLDOWN",        "3.0"))
 MOMENTUM_SL_MIN_AGE           = float(os.getenv("MOMENTUM_SL_MIN_AGE",           "10.0"))
+AI_ADVISOR_ENABLED            = os.getenv("AI_ADVISOR_ENABLED",  "false").lower() == "true"
+AI_ADVISOR_LOOKBACK           = int(os.getenv("AI_ADVISOR_LOOKBACK", "20"))
+AI_ADVISOR_MODEL              = os.getenv("AI_ADVISOR_MODEL", "claude-haiku-4-5-20251001")
 
 # ── Position book ─────────────────────────────────────────────────────────────
 class PositionBook:
@@ -182,6 +191,9 @@ class MomentumTrader:
         self._warn_attempted      = False
         self._insurance_last_ts   = 0.0
         self._insurance_attempted = False
+        self._ai_advice: Optional[str]      = None  # "enter" | "skip" | None
+        self._ai_advice_reason: str         = ""
+        self._ai_advice_requested: bool     = False
         self._current_ticker: Optional[str] = None
 
     # ── Public ────────────────────────────────────────────────────────────────
@@ -200,6 +212,18 @@ class MomentumTrader:
             self._current_ticker = snap.ticker
             now = time.time()
             pos = self._position
+
+            # AI advisor: request advice 60s before entry window (runs in background)
+            if (AI_ADVISOR_ENABLED and _ANTHROPIC_AVAILABLE
+                    and pos is None and not self._entry_attempted
+                    and not self._ai_advice_requested
+                    and elapsed >= MOMENTUM_ENTRY_START - 60):
+                self._ai_advice_requested = True
+                threading.Thread(
+                    target=self._fetch_ai_advice,
+                    args=(snap,),
+                    daemon=True,
+                ).start()
 
             # Phase 1: entry window
             if pos is None and not self._entry_attempted:
@@ -306,9 +330,74 @@ class MomentumTrader:
         self._warn_attempted      = False
         self._insurance_last_ts   = 0.0
         self._insurance_attempted = False
+        self._ai_advice           = None
+        self._ai_advice_reason    = ""
+        self._ai_advice_requested = False
 
     def _notify(self):
         self._on_update(self.asset, dict(self._position) if self._position else None)
+
+    def _fetch_ai_advice(self, snap):
+        """
+        Background thread: call Claude with recent trade history and current
+        market snapshot. Sets self._ai_advice to "enter" or "skip".
+        Falls back to "enter" on any error so the bot never stalls.
+        """
+        try:
+            # Read last N trades from log
+            recent: list[dict] = []
+            if TRADES_FILE.exists():
+                lines = TRADES_FILE.read_text().strip().splitlines()
+                for line in lines[-AI_ADVISOR_LOOKBACK:]:
+                    try:
+                        recent.append(json.loads(line))
+                    except Exception:
+                        pass
+
+            trades_summary = json.dumps(recent, indent=2) if recent else "No trades yet."
+
+            prompt = f"""You are advising a Kalshi 15-minute binary options trading bot for {self.asset}.
+
+Recent trade history (last {len(recent)} trades across all assets):
+{trades_summary}
+
+Current market snapshot for {self.asset} ({snap.ticker}):
+- YES ask: {snap.yes_ask}¢  NO ask: {snap.no_ask}¢
+- YES bid: {snap.yes_bid}¢  NO bid: {snap.no_bid}¢
+- Seconds left in window: {snap.secs_left}
+
+Strategy: enter when one side's ask >= 85¢ in the 13:40-14:20 mark.
+TP at 95-97¢, SL at 60¢. Entry at 85-92¢ gives 7-12¢ upside vs 25-30¢ downside.
+
+Look at recent win/loss patterns, back-to-back losses on same asset, and whether
+the current price looks like strong momentum or a choppy/reversing market.
+
+Should the bot ENTER or SKIP this window?
+Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one short sentence"}}"""
+
+            client   = _anthropic.Anthropic()
+            message  = client.messages.create(
+                model=AI_ADVISOR_MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text.strip()
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            parsed = json.loads(raw)
+            decision = parsed.get("decision", "enter").lower()
+            reason   = parsed.get("reason", "")
+            with self._lock:
+                self._ai_advice        = decision
+                self._ai_advice_reason = reason
+            self._on_log("🤖", (
+                f"AI ADVISOR [{self.asset}]: {decision.upper()} — {reason}"
+            ))
+        except Exception as e:
+            self._on_log("🤖", f"AI ADVISOR error ({self.asset}): {e} — defaulting to enter")
+            with self._lock:
+                self._ai_advice = "enter"
 
     def _try_entry(self, snap):
         """
@@ -341,6 +430,13 @@ class MomentumTrader:
                 f"MOMENTUM ENTRY {self.asset} {side.upper()} skipped — "
                 f"ask={price}¢ >= max={MOMENTUM_ENTRY_MAX}¢ "
                 f"(bad risk/reward: TP target already below entry)"
+            ))
+            return
+
+        if AI_ADVISOR_ENABLED and self._ai_advice == "skip":
+            self._entry_attempted = True
+            self._on_log("🤖", (
+                f"AI ADVISOR skipped {self.asset} entry — {self._ai_advice_reason}"
             ))
             return
 
