@@ -149,6 +149,13 @@ def kalshi_get_public(path: str, params: dict = None) -> dict:
     r.raise_for_status()
     return r.json()
 
+def kalshi_delete(path: str) -> dict:
+    full_path = f"/trade-api/v2{path}"
+    headers   = _auth_headers("DELETE", full_path)
+    r = SESSION.delete(f"{API_BASE}{path}", headers=headers, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
 def pre_warm_connection():
     try:
         kalshi_get("/portfolio/balance")

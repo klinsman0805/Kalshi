@@ -36,7 +36,7 @@ except ImportError:
     pass
 
 from engine import (
-    kalshi_get, _auth_headers, API_BASE, SESSION, ORDER_TIMEOUT,
+    kalshi_get, kalshi_delete, _auth_headers, API_BASE, SESSION, ORDER_TIMEOUT,
     TRADE_SIZE_CONTRACTS, DRY_RUN, ASSETS, WINDOW_SECS,
 )
 
@@ -71,6 +71,10 @@ MOMENTUM_ENTRY_HEDGE_COUNT    = int(os.getenv("MOMENTUM_ENTRY_HEDGE_COUNT",     
 AI_ADVISOR_ENABLED            = os.getenv("AI_ADVISOR_ENABLED",  "false").lower() == "true"
 AI_ADVISOR_LOOKBACK           = int(os.getenv("AI_ADVISOR_LOOKBACK", "20"))
 AI_ADVISOR_MODEL              = os.getenv("AI_ADVISOR_MODEL", "claude-haiku-4-5-20251001")
+
+HEDGING_ENABLED               = os.getenv("HEDGING_ENABLED",          "true").lower() == "true"
+MOMENTUM_COUNTER_START        = int(os.getenv("MOMENTUM_COUNTER_START", "840"))
+MOMENTUM_COUNTER_END          = int(os.getenv("MOMENTUM_COUNTER_END",   "885"))
 
 # ── Position book ─────────────────────────────────────────────────────────────
 class PositionBook:
@@ -148,6 +152,18 @@ def _log_trade(entry: dict):
     except Exception:
         pass
 
+def _cancel_order(order_id: str) -> bool:
+    """Cancel a resting GTC order by order_id. Returns True if successful."""
+    if not order_id or order_id.startswith("dry-"):
+        return True
+    try:
+        kalshi_delete(f"/portfolio/orders/{order_id}")
+        log.info("Cancelled order %s", order_id)
+        return True
+    except Exception as e:
+        log.warning("cancel_order %s failed: %s", order_id, e)
+        return False
+
 # ── Momentum strategy ──────────────────────────────────────────────────────────
 class MomentumTrader:
     """
@@ -196,6 +212,20 @@ class MomentumTrader:
         self._ai_advice_reason: str         = ""
         self._ai_advice_requested: bool     = False
         self._current_ticker: Optional[str] = None
+
+        # Resting GTC SL for main position
+        self._resting_sl_order_id: Optional[str] = None
+        self._sl_check_ts          = 0.0
+
+        # Counter-trade state
+        self._counter_position: Optional[dict]    = None
+        self._counter_entry_attempted             = False
+        self._counter_entry_last_ts               = 0.0
+        self._counter_window_logged               = False
+        self._counter_resting_sl_id: Optional[str] = None
+        self._counter_sl_check_ts                 = 0.0
+        self._counter_tp_last_ts                  = 0.0
+        self._counter_tp_window_logged            = False
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -265,37 +295,91 @@ class MomentumTrader:
                     ))
                 self._try_take_profit(snap)
 
-            # Stop loss: exit + hedge when bid drops to MOMENTUM_STOP_LOSS (any secs_left)
+            # Resting SL status poll (main) — every 5s
+            if (self._resting_sl_order_id
+                    and not self._resting_sl_order_id.startswith("dry-")
+                    and now - self._sl_check_ts >= 5.0):
+                self._sl_check_ts = now
+                self._check_resting_sl_status()
+
+            # Reactive SL fallback — only runs if no resting SL was placed
             pos = self._position
             if (pos is not None and pos["phase"] == "holding"
                     and not self._sl_attempted
+                    and self._resting_sl_order_id is None
                     and now - self._sl_last_ts >= MOMENTUM_STOP_LOSS_COOLDOWN
                     and now - self._entry_last_ts >= MOMENTUM_SL_MIN_AGE):
                 self._try_stop_loss(snap)
 
-            # Warning hedge: only in last 30s — avoids burning money on temporary dips
-            pos = self._position
-            if (pos is not None and pos["phase"] == "holding"
-                    and not self._warn_attempted
-                    and snap.secs_left <= 30
-                    and now - self._warn_last_ts >= MOMENTUM_WARN_COOLDOWN
-                    and now - self._entry_last_ts >= MOMENTUM_SL_MIN_AGE):
-                self._try_warn_hedge(snap)
+            # Warning hedge: last 30s only (gated by HEDGING_ENABLED)
+            if HEDGING_ENABLED:
+                pos = self._position
+                if (pos is not None and pos["phase"] == "holding"
+                        and not self._warn_attempted
+                        and snap.secs_left <= 30
+                        and now - self._warn_last_ts >= MOMENTUM_WARN_COOLDOWN
+                        and now - self._entry_last_ts >= MOMENTUM_SL_MIN_AGE):
+                    self._try_warn_hedge(snap)
 
-            # Insurance: buy cheap opposite side while holding (any secs_left)
-            pos = self._position
-            if (pos is not None and pos["phase"] == "holding"
-                    and not self._insurance_attempted
-                    and now - self._insurance_last_ts >= MOMENTUM_INSURANCE_COOLDOWN):
-                self._try_insurance_hedge(snap)
+            # Insurance: cheap opposite side (gated by HEDGING_ENABLED)
+            if HEDGING_ENABLED:
+                pos = self._position
+                if (pos is not None and pos["phase"] == "holding"
+                        and not self._insurance_attempted
+                        and now - self._insurance_last_ts >= MOMENTUM_INSURANCE_COOLDOWN):
+                    self._try_insurance_hedge(snap)
 
-            # Phase 3: reversal hedge
+            # Reversal hedge (gated by HEDGING_ENABLED)
+            if HEDGING_ENABLED:
+                pos = self._position
+                if (pos is not None and pos["phase"] == "holding"
+                        and snap.secs_left <= 60
+                        and not self._hedge_attempted
+                        and now - self._hedge_last_ts >= MOMENTUM_HEDGE_COOLDOWN):
+                    self._check_reversal_hedge(snap)
+
+            # Counter-trade entry window (840–885s, only after main entry)
             pos = self._position
-            if (pos is not None and pos["phase"] == "holding"
+            if (pos is not None
+                    and self._counter_position is None
+                    and not self._counter_entry_attempted
+                    and now - self._counter_entry_last_ts >= MOMENTUM_ENTRY_RETRY_COOLDOWN):
+                elapsed = WINDOW_SECS - snap.secs_left
+                if MOMENTUM_COUNTER_START <= elapsed <= MOMENTUM_COUNTER_END:
+                    if not self._counter_window_logged:
+                        self._counter_window_logged = True
+                        ctr_side = "no" if pos["side"] == "yes" else "yes"
+                        ctr_ask  = snap.no_ask if ctr_side == "no" else snap.yes_ask
+                        self._on_log("👀", (
+                            f"{self.asset} — counter window open. Watching "
+                            f"{ctr_side.upper()} ask for >={MOMENTUM_ENTRY_THRESHOLD}c "
+                            f"(currently {ctr_ask}c). {snap.secs_left}s left."
+                        ))
+                    self._try_counter_entry(snap)
+
+            # Counter resting SL status poll — every 5s
+            if (self._counter_resting_sl_id
+                    and not self._counter_resting_sl_id.startswith("dry-")
+                    and now - self._counter_sl_check_ts >= 5.0):
+                self._counter_sl_check_ts = now
+                self._check_counter_resting_sl_status()
+
+            # Counter TP
+            cpos = self._counter_position
+            if (cpos is not None and cpos["phase"] == "holding"
                     and snap.secs_left <= 60
-                    and not self._hedge_attempted
-                    and now - self._hedge_last_ts >= MOMENTUM_HEDGE_COOLDOWN):
-                self._check_reversal_hedge(snap)
+                    and now - self._counter_tp_last_ts >= MOMENTUM_TP_COOLDOWN):
+                if not self._counter_tp_window_logged:
+                    self._counter_tp_window_logged = True
+                    cside = cpos["side"]
+                    cbid  = snap.yes_bid if cside == "yes" else snap.no_bid
+                    ctp   = max(MOMENTUM_TAKE_PROFIT, cpos["entry_price"] + 1)
+                    self._on_log("⏱", (
+                        f"{self.asset} — counter last {snap.secs_left}s! "
+                        f"Holding {cside.upper()} at {cpos['entry_price']}c. "
+                        f"Watching bid >= {ctp}c (now {cbid}c)."
+                    ))
+                self._try_counter_tp(snap)
 
     def get_position(self) -> Optional[dict]:
         with self._lock:
@@ -334,6 +418,16 @@ class MomentumTrader:
         self._ai_advice           = None
         self._ai_advice_reason    = ""
         self._ai_advice_requested = False
+        self._resting_sl_order_id = None
+        self._sl_check_ts         = 0.0
+        self._counter_position         = None
+        self._counter_entry_attempted  = False
+        self._counter_entry_last_ts    = 0.0
+        self._counter_window_logged    = False
+        self._counter_resting_sl_id    = None
+        self._counter_sl_check_ts      = 0.0
+        self._counter_tp_last_ts       = 0.0
+        self._counter_tp_window_logged = False
 
     def _notify(self):
         self._on_update(self.asset, dict(self._position) if self._position else None)
@@ -464,8 +558,10 @@ Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one sho
                 "sl_hedge_price": None,
             }
             self._on_log("📋", f"[DRY RUN] MOMENTUM {self.asset} {side.upper()} {price}¢ × {n}")
+            self._resting_sl_order_id = self._place_resting_sl(snap, side, n, "main")
             self._notify()
-            self._buy_entry_hedge(snap, side)
+            if HEDGING_ENABLED:
+                self._buy_entry_hedge(snap, side)
             return
 
         body = {
@@ -506,8 +602,10 @@ Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one sho
                     f"{self.asset} — entered {side.upper()} at {price}¢ × {filled} contracts. "
                     f"Holding position. TP window opens in ~{secs_to_tp}s."
                 ))
+                self._resting_sl_order_id = self._place_resting_sl(snap, side, filled, "main")
                 self._notify()
-                self._buy_entry_hedge(snap, side)
+                if HEDGING_ENABLED:
+                    self._buy_entry_hedge(snap, side)
             else:
                 retryable  = MOMENTUM_ENTRY_THRESHOLD <= price <= MOMENTUM_ENTRY_RETRY_MAX
                 if not retryable:
@@ -597,6 +695,11 @@ Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one sho
         sell_price = current_bid
         cid        = _make_client_id(self.asset, f"mom-tp-{side}")
         profit_est = (sell_price - pos["entry_price"]) * n / 100
+
+        # Cancel resting SL before selling to avoid double-exit
+        if self._resting_sl_order_id:
+            _cancel_order(self._resting_sl_order_id)
+            self._resting_sl_order_id = None
 
         self._on_log("💰", (
             f"{self.asset} — bid hit {sell_price}¢! Taking profit on "
@@ -762,6 +865,11 @@ Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one sho
         n        = pos["count"]
         sl_price = current_bid
         loss_est = (sl_price - entry_price) * n / 100
+
+        # Cancel resting SL to avoid double-exit
+        if self._resting_sl_order_id:
+            _cancel_order(self._resting_sl_order_id)
+            self._resting_sl_order_id = None
 
         self._on_log("🔴", (
             f"STOP LOSS {self.asset} {side.upper()} bid hit {sl_price}¢  "
@@ -965,3 +1073,367 @@ Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one sho
                 ))
         except Exception as e:
             self._on_log("✗", f"INSURANCE error {self.asset}: {e}")
+
+    # ── Resting SL helpers ────────────────────────────────────────────────────
+
+    def _place_resting_sl(self, snap, side: str, count: int, label: str) -> Optional[str]:
+        """
+        Place a GTC sell order at MOMENTUM_STOP_LOSS.
+        NOTE: On Kalshi, a sell limit at 70c placed when bid > 70c will fill immediately
+        at the current market bid (not at 70c). The GTC is most useful as gap protection
+        when the order is placed near the current price. Returns order_id or None.
+        """
+        sl_price = MOMENTUM_STOP_LOSS
+        cid      = _make_client_id(self.asset, f"mom-rsl-{label}-{side}")
+
+        if DRY_RUN:
+            fake_id = f"dry-{label}-{int(time.time())}"
+            self._on_log("📋", (
+                f"[DRY RUN] RESTING SL {self.asset} sell {side.upper()} "
+                f"{sl_price}c x {count} GTC  id={fake_id}"
+            ))
+            return fake_id
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            side,
+            "action":          "sell",
+            "count":           count,
+            "time_in_force":   "good_til_cancelled",
+            "client_order_id": cid,
+        }
+        body["yes_price" if side == "yes" else "no_price"] = sl_price
+
+        try:
+            resp     = _post_order(body)
+            order    = resp.get("order", {})
+            order_id = order.get("order_id")
+            filled   = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                # Filled immediately — treat as SL hit at sl_price
+                entry_price = self._position["entry_price"] if self._position else sl_price
+                pnl = (sl_price - entry_price) * filled / 100
+                POSITIONS.realise_pnl(pnl)
+                if self._position:
+                    self._position["phase"]         = "stop_loss"
+                    self._position["sl_exit_price"] = sl_price
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_resting_sl_imm",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "side": side, "sl_price": sl_price, "count": filled, "pnl": pnl,
+                })
+                self._on_log("🔴", (
+                    f"RESTING SL {self.asset} filled immediately at {sl_price}c x {filled}  "
+                    f"pnl=${pnl:.4f} — position closed"
+                ))
+                self._notify()
+                return None
+            if order_id:
+                self._on_log("📌", (
+                    f"RESTING SL placed {self.asset} sell {side.upper()} "
+                    f"{sl_price}c x {count} GTC  id={order_id}"
+                ))
+            return order_id
+        except Exception as e:
+            self._on_log("✗", f"RESTING SL place error {self.asset}: {e}")
+            return None
+
+    def _check_resting_sl_status(self):
+        """Poll main resting SL order; mark position stop_loss if filled."""
+        order_id = self._resting_sl_order_id
+        if not order_id or not self._position:
+            return
+        try:
+            data   = kalshi_get(f"/portfolio/orders/{order_id}")
+            order  = data.get("order", {})
+            status = order.get("status", "")
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if status in ("filled", "cancelled") or filled >= self._position.get("count", 0):
+                if filled > 0 and self._position["phase"] == "holding":
+                    entry_price = self._position["entry_price"]
+                    sl_price    = MOMENTUM_STOP_LOSS
+                    pnl         = (sl_price - entry_price) * filled / 100
+                    POSITIONS.realise_pnl(pnl)
+                    self._position["phase"]         = "stop_loss"
+                    self._position["sl_exit_price"] = sl_price
+                    _log_trade({
+                        "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_resting_sl",
+                        "asset": self.asset, "ticker": self._position["ticker"],
+                        "side": self._position["side"], "sl_price": sl_price,
+                        "entry_price": entry_price, "count": filled, "pnl": pnl,
+                    })
+                    self._on_log("🔴", (
+                        f"RESTING SL FILLED {self.asset} at {sl_price}c x {filled}  "
+                        f"(entry={entry_price}c)  pnl=${pnl:.4f}"
+                    ))
+                    self._notify()
+                self._resting_sl_order_id = None
+        except Exception as e:
+            log.debug("resting SL status check %s: %s", self.asset, e)
+
+    # ── Counter-trade ─────────────────────────────────────────────────────────
+
+    def _try_counter_entry(self, snap):
+        """
+        After main entry, watch the opposite side during COUNTER_START–COUNTER_END.
+        If opposite ask is in [ENTRY_THRESHOLD, ENTRY_MAX), buy TRADE_SIZE contracts
+        with its own resting GTC SL.
+        """
+        elapsed = WINDOW_SECS - snap.secs_left
+        if not (MOMENTUM_COUNTER_START <= elapsed <= MOMENTUM_COUNTER_END):
+            self._counter_entry_last_ts = time.time()
+            return
+
+        pos          = self._position
+        entry_side   = pos["side"]
+        counter_side = "no" if entry_side == "yes" else "yes"
+        counter_ask  = snap.no_ask if counter_side == "no" else snap.yes_ask
+
+        if counter_ask is None:
+            return
+
+        if not (MOMENTUM_ENTRY_THRESHOLD <= counter_ask < MOMENTUM_ENTRY_MAX):
+            self._on_log("👀", (
+                f"{self.asset} — counter watching {counter_side.upper()} ask {counter_ask}c "
+                f"(need {MOMENTUM_ENTRY_THRESHOLD}-{MOMENTUM_ENTRY_MAX - 1}c)  {snap.secs_left}s left."
+            ))
+            self._counter_entry_last_ts = time.time()
+            return
+
+        n   = TRADE_SIZE_CONTRACTS
+        cid = _make_client_id(self.asset, f"mom-ctr-{counter_side}")
+
+        self._on_log("🎯", (
+            f"COUNTER ENTRY {self.asset} {counter_side.upper()} at {counter_ask}c  "
+            f"(elapsed={elapsed}s  secs_left={snap.secs_left})"
+        ))
+
+        if DRY_RUN:
+            self._counter_entry_attempted = True
+            self._counter_position = {
+                "ticker":      snap.ticker,
+                "side":        counter_side,
+                "entry_price": counter_ask,
+                "count":       n,
+                "entry_ts":    datetime.now(timezone.utc).isoformat(),
+                "phase":       "holding",
+            }
+            self._on_log("📋", (
+                f"[DRY RUN] COUNTER ENTRY {self.asset} {counter_side.upper()} {counter_ask}c x {n}"
+            ))
+            self._counter_resting_sl_id = self._place_counter_resting_sl(snap, counter_side, n)
+            return
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            counter_side,
+            "action":          "buy",
+            "count":           n,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid,
+        }
+        body["yes_price" if counter_side == "yes" else "no_price"] = counter_ask
+
+        self._counter_entry_last_ts = time.time()
+        try:
+            resp   = _post_order(body)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                self._counter_entry_attempted = True
+                self._counter_position = {
+                    "ticker":      snap.ticker,
+                    "side":        counter_side,
+                    "entry_price": counter_ask,
+                    "count":       filled,
+                    "entry_ts":    datetime.now(timezone.utc).isoformat(),
+                    "phase":       "holding",
+                }
+                POSITIONS.record_fill(snap.ticker, counter_side, counter_ask, filled, cid)
+                _log_trade({
+                    "ts": self._counter_position["entry_ts"], "type": "momentum_counter_entry",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "side": counter_side, "price": counter_ask, "count": filled,
+                })
+                self._on_log("✅", (
+                    f"{self.asset} — counter entered {counter_side.upper()} at {counter_ask}c x {filled}. "
+                    f"Placing resting SL at {MOMENTUM_STOP_LOSS}c."
+                ))
+                self._counter_resting_sl_id = self._place_counter_resting_sl(snap, counter_side, filled)
+            else:
+                retryable = MOMENTUM_ENTRY_THRESHOLD <= counter_ask <= MOMENTUM_ENTRY_RETRY_MAX
+                if not retryable:
+                    self._counter_entry_attempted = True
+                self._on_log("⏸", (
+                    f"COUNTER ENTRY {self.asset} {counter_side.upper()} {counter_ask}c — no fill"
+                    + ("" if retryable else ", skipping")
+                ))
+        except Exception as e:
+            self._on_log("✗", f"COUNTER ENTRY error {self.asset}: {e}")
+
+    def _place_counter_resting_sl(self, snap, side: str, count: int) -> Optional[str]:
+        """Place resting GTC SL for counter position. Same logic as main SL."""
+        sl_price = MOMENTUM_STOP_LOSS
+        cid      = _make_client_id(self.asset, f"mom-rsl-ctr-{side}")
+
+        if DRY_RUN:
+            fake_id = f"dry-ctr-{int(time.time())}"
+            self._on_log("📋", (
+                f"[DRY RUN] COUNTER RESTING SL {self.asset} sell {side.upper()} "
+                f"{sl_price}c x {count} GTC  id={fake_id}"
+            ))
+            return fake_id
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            side,
+            "action":          "sell",
+            "count":           count,
+            "time_in_force":   "good_til_cancelled",
+            "client_order_id": cid,
+        }
+        body["yes_price" if side == "yes" else "no_price"] = sl_price
+
+        try:
+            resp     = _post_order(body)
+            order    = resp.get("order", {})
+            order_id = order.get("order_id")
+            filled   = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                entry_price = self._counter_position["entry_price"] if self._counter_position else sl_price
+                pnl = (sl_price - entry_price) * filled / 100
+                POSITIONS.realise_pnl(pnl)
+                if self._counter_position:
+                    self._counter_position["phase"]         = "stop_loss"
+                    self._counter_position["sl_exit_price"] = sl_price
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_counter_rsl_imm",
+                    "asset": self.asset, "side": side, "sl_price": sl_price, "count": filled, "pnl": pnl,
+                })
+                self._on_log("🔴", (
+                    f"COUNTER RESTING SL {self.asset} filled immediately at {sl_price}c x {filled}  "
+                    f"pnl=${pnl:.4f}"
+                ))
+                return None
+            if order_id:
+                self._on_log("📌", (
+                    f"COUNTER RESTING SL placed {self.asset} sell {side.upper()} "
+                    f"{sl_price}c x {count} GTC  id={order_id}"
+                ))
+            return order_id
+        except Exception as e:
+            self._on_log("✗", f"COUNTER RESTING SL place error {self.asset}: {e}")
+            return None
+
+    def _check_counter_resting_sl_status(self):
+        """Poll counter resting SL order; mark counter position stop_loss if filled."""
+        order_id = self._counter_resting_sl_id
+        if not order_id or not self._counter_position:
+            return
+        try:
+            data   = kalshi_get(f"/portfolio/orders/{order_id}")
+            order  = data.get("order", {})
+            status = order.get("status", "")
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if status in ("filled", "cancelled") or filled >= self._counter_position.get("count", 0):
+                if filled > 0 and self._counter_position["phase"] == "holding":
+                    entry_price = self._counter_position["entry_price"]
+                    sl_price    = MOMENTUM_STOP_LOSS
+                    pnl         = (sl_price - entry_price) * filled / 100
+                    POSITIONS.realise_pnl(pnl)
+                    self._counter_position["phase"]         = "stop_loss"
+                    self._counter_position["sl_exit_price"] = sl_price
+                    _log_trade({
+                        "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_counter_rsl",
+                        "asset": self.asset, "sl_price": sl_price,
+                        "entry_price": entry_price, "count": filled, "pnl": pnl,
+                    })
+                    self._on_log("🔴", (
+                        f"COUNTER RESTING SL FILLED {self.asset} at {sl_price}c x {filled}  "
+                        f"(entry={entry_price}c)  pnl=${pnl:.4f}"
+                    ))
+                self._counter_resting_sl_id = None
+        except Exception as e:
+            log.debug("counter SL status check %s: %s", self.asset, e)
+
+    def _try_counter_tp(self, snap):
+        """Take profit on counter position when its bid >= TP target."""
+        self._counter_tp_last_ts = time.time()
+        cpos = self._counter_position
+        side = cpos["side"]
+
+        current_bid = snap.yes_bid if side == "yes" else snap.no_bid
+        tp_target   = max(MOMENTUM_TAKE_PROFIT, cpos["entry_price"] + 1)
+        if current_bid is None or current_bid < tp_target:
+            if current_bid is not None:
+                self._on_log("⏳", (
+                    f"{self.asset} counter — bid {current_bid}c, need {tp_target}c  "
+                    f"{snap.secs_left}s left."
+                ))
+            return
+
+        # Cancel counter resting SL before selling
+        if self._counter_resting_sl_id:
+            _cancel_order(self._counter_resting_sl_id)
+            self._counter_resting_sl_id = None
+
+        n          = cpos["count"]
+        sell_price = current_bid
+        cid        = _make_client_id(self.asset, f"mom-ctr-tp-{side}")
+        profit_est = (sell_price - cpos["entry_price"]) * n / 100
+
+        self._on_log("💰", (
+            f"{self.asset} counter — bid hit {sell_price}c! TP on {side.upper()} "
+            f"(entry {cpos['entry_price']}c)  est. profit: +${profit_est:.4f}"
+        ))
+
+        if DRY_RUN:
+            POSITIONS.realise_pnl(profit_est)
+            self._counter_position["phase"] = "closed"
+            self._on_log("📋", (
+                f"[DRY RUN] COUNTER TP {self.asset} {sell_price}c x {n}  pnl=+${profit_est:.4f}"
+            ))
+            return
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            side,
+            "action":          "sell",
+            "count":           n,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid,
+        }
+        body["yes_price" if side == "yes" else "no_price"] = sell_price
+
+        try:
+            resp   = _post_order(body)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                pnl = (sell_price - cpos["entry_price"]) * filled / 100
+                POSITIONS.realise_pnl(pnl)
+                remaining = cpos["count"] - filled
+                if remaining <= 0:
+                    self._counter_position["phase"] = "closed"
+                else:
+                    self._counter_position["count"] = remaining
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_counter_tp",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "side": side, "sell_price": sell_price,
+                    "entry_price": cpos["entry_price"], "count": filled, "pnl": pnl,
+                })
+                self._on_log("✅", (
+                    f"{self.asset} — counter TP! Sold {side.upper()} at {sell_price}c x {filled}  "
+                    f"pnl=+${pnl:.4f}"
+                ))
+            else:
+                self._on_log("⏸", (
+                    f"{self.asset} — counter TP at {sell_price}c no fill, retrying."
+                ))
+        except Exception as e:
+            self._on_log("✗", f"COUNTER TP error {self.asset}: {e}")
+
+    def get_counter_position(self) -> Optional[dict]:
+        with self._lock:
+            return dict(self._counter_position) if self._counter_position else None
